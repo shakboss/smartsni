@@ -1,0 +1,17 @@
+{
+  "host": "home.shaktt.xyz",
+  "reload_interval_minutes": 1,
+  "domains": {
+    "youtube": "190.83.181.12",
+    "google": "190.83.181.12"
+  },
+  "bypass_settings": {
+    "enabled": true,
+    "trigger_sni": "mail.shaktt.xyz",
+    "padding_size_range": [ 10, 100 ],
+    "delay_ms_range": [ 5, 20 ],
+    "detect_mobile_networks": true,
+    "geoip_db_path": "/path/to/GeoLite2-ASN.mmdb",
+    "mobile_carrier_names": ["at&t", "verizon", "Digicel", "bmobile"]
+  }
+}
