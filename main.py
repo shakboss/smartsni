@@ -781,16 +781,20 @@ async def start_sni_proxy():
     import pathlib
 
     ssl_context = None
-    cert_dir = pathlib.Path("/etc/letsencrypt/live")
+    install_dir = pathlib.Path(os.environ.get("INSTALL_DIR", "/opt/smartSNI"))
+    local_certs = install_dir / "certs"
 
+    cert_paths = [
+        (local_certs / "fullchain.pem", local_certs / "privkey.pem"),
+    ]
+    letsencrypt_dir = pathlib.Path("/etc/letsencrypt/live")
     async with state.config_lock:
         domains_to_try = [state.config.get("host", "")] + state.config.get("trigger_domains", [])
-
     for domain in domains_to_try:
-        if not domain:
-            continue
-        cert_path = cert_dir / domain / "fullchain.pem"
-        key_path = cert_dir / domain / "privkey.pem"
+        if domain:
+            cert_paths.append((letsencrypt_dir / domain / "fullchain.pem", letsencrypt_dir / domain / "privkey.pem"))
+
+    for cert_path, key_path in cert_paths:
         if cert_path.exists() and key_path.exists():
             ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
             ssl_context.load_cert_chain(str(cert_path), str(key_path))

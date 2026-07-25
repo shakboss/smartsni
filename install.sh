@@ -138,6 +138,13 @@ cat > "$INSTALL_DIR/config.json" <<EOF
 EOF
 ok "Config written"
 
+# --- Copy certs so smart-sni user can read them ---
+CERTS_DIR="$INSTALL_DIR/certs"
+mkdir -p "$CERTS_DIR"
+cp "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" "$CERTS_DIR/fullchain.pem"
+cp "/etc/letsencrypt/live/$DOMAIN/privkey.pem" "$CERTS_DIR/privkey.pem"
+chmod 644 "$CERTS_DIR"/*.pem
+
 # --- Python venv ---
 info "Setting up Python..."
 cd "$INSTALL_DIR"
@@ -182,7 +189,7 @@ systemctl start $SERVICE_NAME
 ok "Service started"
 
 # --- Certbot renewal ---
-(crontab -l 2>/dev/null; echo "0 3 * * * certbot renew --quiet --deploy-hook 'systemctl restart $SERVICE_NAME'") | sort -u | crontab - 2>/dev/null
+(crontab -l 2>/dev/null; echo "0 3 * * * certbot renew --quiet --deploy-hook 'cp /etc/letsencrypt/live/$DOMAIN/fullchain.pem $INSTALL_DIR/certs/fullchain.pem && cp /etc/letsencrypt/live/$DOMAIN/privkey.pem $INSTALL_DIR/certs/privkey.pem && systemctl restart $SERVICE_NAME'") | sort -u | crontab - 2>/dev/null
 ok "Auto-renewal set"
 
 # --- Done ---
