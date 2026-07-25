@@ -150,7 +150,8 @@ ok "Python ready"
 
 # --- Service user ---
 useradd --system --shell /usr/sbin/nologin --home-dir "$INSTALL_DIR" smart-sni 2>/dev/null || true
-setcap cap_net_bind_service=+ep "$INSTALL_DIR/venv/bin/python3"
+REAL_PYTHON=$(readlink -f "$INSTALL_DIR/venv/bin/python3")
+setcap cap_net_bind_service=+ep "$REAL_PYTHON" 2>/dev/null || true
 chown -R smart-sni:smart-sni "$INSTALL_DIR"
 ok "User created"
 
