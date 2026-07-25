@@ -127,31 +127,34 @@ check_system_requirements() {
     # CPU cores
     local cores
     cores=$(nproc 2>/dev/null || echo 1)
-    if [[ $cores -ge 2 ]]; then
+    if [[ $cores -ge 1 ]]; then
         ok "CPU cores: $cores"
     else
-        warn "CPU cores: $cores (recommended: 2+)"
+        error "CPU cores: $cores (minimum: 1)"
+        ((issues++))
     fi
 
     # RAM
     local ram_mb
     ram_mb=$(free -m 2>/dev/null | awk '/^Mem:/{print $2}' || echo 0)
-    if [[ $ram_mb -ge 512 ]]; then
+    if [[ $ram_mb -ge 256 ]]; then
         ok "RAM: ${ram_mb}MB"
-    elif [[ $ram_mb -ge 256 ]]; then
-        warn "RAM: ${ram_mb}MB (recommended: 512MB+)"
+    elif [[ $ram_mb -ge 128 ]]; then
+        warn "RAM: ${ram_mb}MB (recommended: 256MB+)"
     else
-        error "RAM: ${ram_mb}MB (minimum: 256MB)"
+        error "RAM: ${ram_mb}MB (minimum: 128MB)"
         ((issues++))
     fi
 
     # Disk space
     local disk_free
     disk_free=$(df -m / 2>/dev/null | awk 'NR==2{print $4}' || echo 0)
-    if [[ $disk_free -ge 1 ]]; then
+    if [[ $disk_free -ge 15000 ]]; then
         ok "Disk free: ${disk_free}MB"
+    elif [[ $disk_free -ge 500 ]]; then
+        warn "Disk free: ${disk_free}MB (recommended: 15GB+)"
     else
-        error "Disk free: ${disk_free}MB (need at least 500MB)"
+        error "Disk free: ${disk_free}MB (minimum: 500MB)"
         ((issues++))
     fi
 
