@@ -42,6 +42,38 @@ if DEBUG:
 
 
 # ---------------------------------------------------------------------------
+# Rate Limiter (sliding window per IP)
+# ---------------------------------------------------------------------------
+class RateLimiter:
+    def __init__(self, max_connections: int = 30, window_seconds: int = 60):
+        self.max_connections = max_connections
+        self.window_seconds = window_seconds
+        self._hits: Dict[float, List[float]] = defaultdict(list)
+        self._lock = asyncio.Lock()
+
+    async def allow(self, ip: str) -> bool:
+        async with self._lock:
+            now = time.monotonic()
+            cutoff = now - self.window_seconds
+            self._hits[ip] = [t for t in self._hits[ip] if t > cutoff]
+            if len(self._hits[ip]) >= self.max_connections:
+                logging.warning(f"Rate limit exceeded for {ip}: {len(self._hits[ip])} connections in {self.window_seconds}s")
+                return False
+            self._hits[ip].append(now)
+            return True
+
+    async def cleanup(self):
+        while True:
+            await asyncio.sleep(self.window_seconds * 2)
+            async with self._lock:
+                now = time.monotonic()
+                cutoff = now - self.window_seconds
+                stale = [ip for ip, times in self._hits.items() if not times or times[-1] <= cutoff]
+                for ip in stale:
+                    del self._hits[ip]
+
+
+# ---------------------------------------------------------------------------
 # Application State (replaces scattered globals)
 # ---------------------------------------------------------------------------
 class AppState:
@@ -199,38 +231,6 @@ async def get_active_trigger_domain() -> str:
         if domains:
             return domains[state.active_trigger_domain_index % len(domains)]
         return state.config.get("bypass_settings", {}).get("trigger_sni", "")
-
-
-# ---------------------------------------------------------------------------
-# Rate Limiter (sliding window per IP)
-# ---------------------------------------------------------------------------
-class RateLimiter:
-    def __init__(self, max_connections: int = 30, window_seconds: int = 60):
-        self.max_connections = max_connections
-        self.window_seconds = window_seconds
-        self._hits: Dict[float, List[float]] = defaultdict(list)
-        self._lock = asyncio.Lock()
-
-    async def allow(self, ip: str) -> bool:
-        async with self._lock:
-            now = time.monotonic()
-            cutoff = now - self.window_seconds
-            self._hits[ip] = [t for t in self._hits[ip] if t > cutoff]
-            if len(self._hits[ip]) >= self.max_connections:
-                logging.warning(f"Rate limit exceeded for {ip}: {len(self._hits[ip])} connections in {self.window_seconds}s")
-                return False
-            self._hits[ip].append(now)
-            return True
-
-    async def cleanup(self):
-        while True:
-            await asyncio.sleep(self.window_seconds * 2)
-            async with self._lock:
-                now = time.monotonic()
-                cutoff = now - self.window_seconds
-                stale = [ip for ip, times in self._hits.items() if not times or times[-1] <= cutoff]
-                for ip in stale:
-                    del self._hits[ip]
 
 
 # ---------------------------------------------------------------------------
