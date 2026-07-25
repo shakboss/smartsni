@@ -94,13 +94,10 @@ class SmartSniVpnService : VpnService(), NetworkDetector.Listener {
             return START_NOT_STICKY
         }
 
-        val padMin = intent?.getIntExtra("pad_min", 10) ?: 10
-        val padMax = intent?.getIntExtra("pad_max", 100) ?: 100
         val delayMin = intent?.getIntExtra("delay_min", 5) ?: 5
         val delayMax = intent?.getIntExtra("delay_max", 20) ?: 20
 
         trafficShaper = TrafficShaper(
-            paddingRange = padMin..padMax,
             delayMsRange = delayMin..delayMax,
             jitterEnabled = true
         )
@@ -387,7 +384,6 @@ class SmartSniVpnService : VpnService(), NetworkDetector.Listener {
         val remoteSeq = tcpHeader.seq + 1
 
         val shaperForConn = TrafficShaper(
-            paddingRange = trafficShaper?.let { 10..100 } ?: 0..0,
             delayMsRange = trafficShaper?.let { 5..20 } ?: 0..0,
             jitterEnabled = trafficShaper?.isEnabled() == true
         )

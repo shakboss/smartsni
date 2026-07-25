@@ -117,7 +117,7 @@ class MainActivity : AppCompatActivity() {
         isConnecting = true
         updateUI(false, connecting = true)
         appendLog("Starting VPN...")
-        appendLog("DPI bypass: enabled (padding + delays)")
+        appendLog("DPI bypass: enabled (random delays)")
         appendLog("DNS: DoH via SmartSNI")
 
         val intent = Intent(this, SmartSniVpnService::class.java).apply {
@@ -125,8 +125,6 @@ class MainActivity : AppCompatActivity() {
             putExtra("ws_path", wsPathInput.text.toString().trim())
             putExtra("bypass_secret", secretInput.text.toString().trim())
             putExtra("trigger_sni", triggerSniInput.text.toString().trim())
-            putExtra("pad_min", 10)
-            putExtra("pad_max", 100)
             putExtra("delay_min", 5)
             putExtra("delay_max", 20)
         }

@@ -285,26 +285,18 @@ async def shape_and_relay(reader: asyncio.StreamReader, writer: asyncio.StreamWr
 
 
 async def obfuscate_and_relay_ws(source_reader: asyncio.StreamReader, dest_ws: WebSocket, settings: BypassSettings):
-    """Reads from a stream, obfuscates, and sends over a WebSocket."""
+    """Reads from a stream and sends over a WebSocket (clean, no padding).
+
+    Padding is NOT applied here because the Android client expects clean data
+    to write back to the TUN interface. Padding is only useful for raw TCP
+    tunnels (shape mode) where the client can strip it.
+    """
     try:
         while not source_reader.at_eof():
-            data = await source_reader.read(2048)  # Read smaller chunks
+            data = await source_reader.read(2048)
             if not data:
                 break
-
-            # Add random padding to the data chunk
-            if settings.padding_size_range and settings.padding_size_range[1] > 0:
-                min_pad, max_pad = settings.padding_size_range
-                padding = os.urandom(random.randint(min_pad, max_pad))
-                data += padding
-
             await dest_ws.send_bytes(data)
-
-            # Add random delay between sending chunks
-            if settings.delay_ms_range and settings.delay_ms_range[1] > 0:
-                min_delay, max_delay = settings.delay_ms_range
-                delay = random.randint(min_delay, max_delay) / 1000.0
-                await asyncio.sleep(delay)
     except (WebSocketDisconnect, ConnectionResetError):
         pass
 

@@ -70,11 +70,7 @@ class WebSocketTunnel(
             }
 
             override fun onMessage(ws: WebSocket, bytes: ByteString) {
-                val rawData = bytes.toByteArray()
-                val data = if (trafficShaper?.isEnabled() == true) {
-                    trafficShaper.stripFrameNoise(rawData)
-                } else rawData
-                handleServerData(data)
+                handleServerData(bytes.toByteArray())
             }
 
             override fun onMessage(ws: WebSocket, text: String) {
@@ -158,9 +154,7 @@ class WebSocketTunnel(
         if (!connected.get()) return false
         val ws = webSocket ?: return false
         return try {
-            val shaped = trafficShaper?.shapeOutgoing(data) ?: TrafficShaper.ShapedData(data, 0)
-            val framed = trafficShaper?.addFrameNoise(shaped.payload) ?: data
-            ws.send(framed.toByteString(0, framed.size))
+            ws.send(data.toByteString(0, data.size))
             true
         } catch (e: Exception) {
             Log.e("WS-Tunnel", "Send failed: ${e.message}")
