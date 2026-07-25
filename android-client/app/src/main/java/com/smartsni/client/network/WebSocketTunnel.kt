@@ -30,7 +30,6 @@ class WebSocketTunnel(
     private var listener: Listener? = null
     private val connected = AtomicBoolean(false)
     private val random = SecureRandom()
-    private var coverTrafficJob: java.util.concurrent.ScheduledExecutorService? = null
 
     private var pendingTargetHost: String = ""
     private var pendingTargetPort: Int = 0
@@ -38,7 +37,6 @@ class WebSocketTunnel(
     private var isRetrying = false
 
     private val client: OkHttpClient
-
     init {
         val socketFactory = ChromeTlsFingerprint.createSocketFactory()
         val trustManager = object : javax.net.ssl.X509TrustManager {
@@ -128,21 +126,18 @@ class WebSocketTunnel(
             }
 
             override fun onClosing(ws: WebSocket, code: Int, reason: String) {
-                stopCoverTraffic()
                 ws.close(1000, null)
                 listener?.onDisconnected("Closing: $reason")
                 connected.set(false)
             }
 
             override fun onClosed(ws: WebSocket, code: Int, reason: String) {
-                stopCoverTraffic()
                 Log.i("WS-Tunnel", "Closed: $code $reason")
                 listener?.onDisconnected("$code: $reason")
                 connected.set(false)
             }
 
             override fun onFailure(ws: WebSocket, t: Throwable, response: Response?) {
-                stopCoverTraffic()
                 Log.e("WS-Tunnel", "Failed: ${t.message}")
                 connected.set(false)
                 if (!isRetrying && currentFallbackIndex < fallbackHosts.size) {
@@ -169,25 +164,25 @@ class WebSocketTunnel(
     private fun handleServerData(data: ByteArray) {
         if (data.isEmpty()) return
 
+        val stripped = stripPadding(data)
+
         when {
-            data.size >= 2 && data[0] == 0x05.toByte() && data[1] == 0x00.toByte() && data.size == 3 -> {
+            stripped.size == 2 && stripped[0] == 0x05.toByte() && stripped[1] == 0x00.toByte() -> {
                 Log.d("WS-Tunnel", "SOCKS5 method selected, sending CONNECT")
                 sendSocks5Connect()
             }
-            data.size >= 2 && data[0] == 0x05.toByte() && data[1] == 0x00.toByte() && data.size >= 10 -> {
+            stripped.size >= 10 && stripped[0] == 0x05.toByte() && stripped[1] == 0x00.toByte() -> {
                 Log.i("WS-Tunnel", "SOCKS5 CONNECT success")
                 connected.set(true)
                 listener?.onTunnelReady()
-                startCoverTraffic()
             }
-            data.size >= 2 && data[0] == 0x05.toByte() && data[1] != 0x00.toByte() -> {
-                Log.e("WS-Tunnel", "SOCKS5 error: ${data[1]}")
-                listener?.onError("SOCKS5 connection failed: ${data[1]}")
+            stripped.size >= 2 && stripped[0] == 0x05.toByte() && stripped[1] != 0x00.toByte() -> {
+                Log.e("WS-Tunnel", "SOCKS5 error: ${stripped[1]}")
+                listener?.onError("SOCKS5 connection failed: ${stripped[1]}")
                 webSocket?.close(1011, "SOCKS5 error")
             }
             else -> {
                 if (connected.get()) {
-                    val stripped = stripPadding(data)
                     if (stripped.isNotEmpty()) {
                         listener?.onDataReceived(stripped)
                     }
@@ -235,50 +230,7 @@ class WebSocketTunnel(
         }
     }
 
-    private fun startCoverTraffic() {
-        coverTrafficJob = java.util.concurrent.Executors.newSingleThreadScheduledExecutor()
-        coverTrafficJob?.scheduleWithFixedDelay({
-            try {
-                if (connected.get()) {
-                    val coverData = generateCoverPayload()
-                    webSocket?.send(coverData.toByteString(0, coverData.size))
-                }
-            } catch (e: Exception) {
-                Log.d("WS-Tunnel", "Cover traffic error: ${e.message}")
-            }
-        }, 5, 5 + random.nextInt(10), TimeUnit.SECONDS)
-    }
-
-    private fun stopCoverTraffic() {
-        coverTrafficJob?.shutdownNow()
-        coverTrafficJob = null
-    }
-
-    private fun generateCoverPayload(): ByteArray {
-        val type = random.nextInt(3)
-        return when (type) {
-            0 -> {
-                val ws = webSocket
-                if (ws != null) {
-                    val pingData = ByteArray(4)
-                    random.nextBytes(pingData)
-                    pingData
-                } else ByteArray(0)
-            }
-            1 -> {
-                val heartbeat = "{\"type\":\"ping\",\"ts\":${System.currentTimeMillis()}}"
-                heartbeat.toByteArray(Charsets.UTF_8)
-            }
-            else -> {
-                val keepAlive = ByteArray(8 + random.nextInt(32))
-                random.nextBytes(keepAlive)
-                keepAlive
-            }
-        }
-    }
-
     fun disconnect() {
-        stopCoverTraffic()
         connected.set(false)
         webSocket?.close(1000, "Disconnect")
         webSocket = null
