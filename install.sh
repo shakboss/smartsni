@@ -81,8 +81,16 @@ install() {
         read -p "Do you want to enable advanced DPI bypass features? (y/n): " enable_bypass
         if [[ "$enable_bypass" == "y" || "$enable_bypass" == "Y" ]]; then
             default_trigger="bypass.$domain"
-            read -p "Enter the trigger domain for bypass (e.g., $default_trigger): " trigger_sni
+            read -p "Enter the primary trigger domain (e.g., $default_trigger): " trigger_sni
             [ -z "$trigger_sni" ] && trigger_sni=$default_trigger
+
+            read -p "Enter fallback trigger domains, comma-separated (e.g., cdn.$domain,mail2.$domain) [optional]: " fallback_domains
+
+            trigger_domains_json=$(jq -n --arg primary "$trigger_sni" --arg fallbacks "$fallback_domains" \
+                '[$primary] + (if $fallbacks != "" then ($fallbacks | split(",") | map(select(. != ""))) else [] end)')
+
+            read -p "Domain rotation interval in minutes [default: 60]: " rotation_minutes
+            [ -z "$rotation_minutes" ] && rotation_minutes=60
 
             read -p "Choose bypass mode [1] shape (default) [2] websocket: " bypass_mode_choice
             local bypass_mode="shape"
@@ -105,19 +113,60 @@ install() {
             fi
 
             bypass_config=$(jq -n \
+                --argjson trigger_domains "$trigger_domains_json" \
+                --argjson rotation "$rotation_minutes" \
                 --arg trigger_sni "$trigger_sni" \
                 --arg mode "$bypass_mode" \
                 --arg tunnel_path "$tunnel_path" \
-                '{ "bypass_settings": { "enabled": true, "mode": $mode, "trigger_sni": $trigger_sni, "tunnel_path": $tunnel_path, "padding_size_range": [10, 100], "delay_ms_range": [5, 20] } }')
+                '{ "trigger_domains": $trigger_domains, "domain_rotation_minutes": $rotation, "bypass_settings": { "enabled": true, "mode": $mode, "trigger_sni": $trigger_sni, "tunnel_path": $tunnel_path, "padding_size_range": [10, 100], "delay_ms_range": [5, 20] } }')
             if [[ "$bypass_mode" == "websocket" ]]; then
                 bypass_config=$(echo "$bypass_config" | jq --arg host "$socks_host" --argjson port "$socks_port" --arg secret "$bypass_secret" '.bypass_settings += { "socks_host": $host, "socks_port": $port, "bypass_secret": $secret }')
             fi
             jq --argjson bypass "$bypass_config" '. + $bypass' "$INSTALL_DIR/config.json" > "$INSTALL_DIR/config.tmp" && mv "$INSTALL_DIR/config.tmp" "$INSTALL_DIR/config.json"
 
-            echo "Bypass features enabled with trigger SNI: $trigger_sni"
+            echo "Bypass features enabled with trigger domains: $trigger_sni"
+            echo "Domain rotation interval: ${rotation_minutes} minutes"
             echo "Bypass mode set to: $bypass_mode"
             if [[ "$bypass_mode" == "websocket" ]]; then
                 echo "Your WebSocket bypass secret is: $bypass_secret"
+            fi
+
+            read -p "Do you want to enable domain fronting to hide the real server behind a CDN? (y/n): " enable_fronting
+            if [[ "$enable_fronting" == "y" || "$enable_fronting" == "Y" ]]; then
+                default_front_host="cdn.jsdelivr.net"
+                read -p "Enter CDN front host [default: $default_front_host]: " front_host
+                [ -z "$front_host" ] && front_host=$default_front_host
+
+                read -p "Enter CDN TLS SNI [default: $front_host]: " front_sni
+                [ -z "$front_sni" ] && front_sni=$front_host
+
+                read -p "Enter upstream host (your server domain) [default: $trigger_sni]: " upstream_host
+                [ -z "$upstream_host" ] && upstream_host=$trigger_sni
+
+                fronting_config=$(jq -n \
+                    --arg front_host "$front_host" \
+                    --arg front_sni "$front_sni" \
+                    --arg upstream "$upstream_host" \
+                    '{ "domain_fronting": { "enabled": true, "front_host": $front_host, "front_sni": $front_sni, "upstream_host": $upstream } }')
+
+                jq --argjson front "$fronting_config" '. + $front' "$INSTALL_DIR/config.json" > "$INSTALL_DIR/config.tmp" && mv "$INSTALL_DIR/config.tmp" "$INSTALL_DIR/config.json"
+
+                echo "Domain fronting enabled: TLS SNI=$front_sni, Host=$upstream_host"
+            fi
+
+            read -p "Do you want to enable Cloudflare proxy support? (y/n): " enable_cf
+            if [[ "$enable_cf" == "y" || "$enable_cf" == "Y" ]]; then
+                read -p "Enter Cloudflare Zone ID: " cf_zone
+                read -p "Enter Cloudflare API Token: " cf_token
+
+                cf_config=$(jq -n \
+                    --arg zone "$cf_zone" \
+                    --arg token "$cf_token" \
+                    '{ "cloudflare": { "enabled": true, "zone_id": $zone, "api_token": $token } }')
+
+                jq --argjson cf "$cf_config" '. + $cf' "$INSTALL_DIR/config.json" > "$INSTALL_DIR/config.tmp" && mv "$INSTALL_DIR/config.tmp" "$INSTALL_DIR/config.json"
+
+                echo "Cloudflare proxy support enabled."
             fi
 
             read -p "Do you want to enable automatic bypass for mobile networks? (y/n): " enable_mobile_detect
