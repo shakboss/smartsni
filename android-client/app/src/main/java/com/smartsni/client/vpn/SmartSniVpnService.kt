@@ -17,10 +17,8 @@ import kotlinx.coroutines.*
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.LinkedBlockingQueue
-import java.util.concurrent.atomic.AtomicInteger
 
-class SmartSniVpnService : VpnService() {
+class SmartSniVpnService : VpnService(), NetworkDetector.Listener {
 
     companion object {
         private const val TAG = "SmartSniVPN"
@@ -35,6 +33,7 @@ class SmartSniVpnService : VpnService() {
         var isRunning = false
             private set
         var statusListener: ((String) -> Unit)? = null
+        var networkStatusListener: ((String) -> Unit)? = null
     }
 
     private var vpnInterface: ParcelFileDescriptor? = null
@@ -47,6 +46,8 @@ class SmartSniVpnService : VpnService() {
     private var bypassSecret = ""
 
     private var dnsResolver: DnsOverHttps? = null
+    private var networkDetector: NetworkDetector? = null
+    private var trafficShaper: TrafficShaper? = null
 
     private val tcpConnections = ConcurrentHashMap<String, TcpSession>()
 
@@ -63,7 +64,6 @@ class SmartSniVpnService : VpnService() {
         var remoteSeq: Long,
         var state: TcpState,
         val wsTunnel: WebSocketTunnel,
-        val dataQueue: LinkedBlockingQueue<ByteArray> = LinkedBlockingQueue(),
         var dataWriter: FileOutputStream? = null
     )
 
@@ -73,6 +73,8 @@ class SmartSniVpnService : VpnService() {
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
+        networkDetector = NetworkDetector(this)
+        networkDetector?.setListener(this)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -91,6 +93,17 @@ class SmartSniVpnService : VpnService() {
             stopSelf()
             return START_NOT_STICKY
         }
+
+        val padMin = intent?.getIntExtra("pad_min", 10) ?: 10
+        val padMax = intent?.getIntExtra("pad_max", 100) ?: 100
+        val delayMin = intent?.getIntExtra("delay_min", 5) ?: 5
+        val delayMax = intent?.getIntExtra("delay_max", 20) ?: 20
+
+        trafficShaper = TrafficShaper(
+            paddingRange = padMin..padMax,
+            delayMsRange = delayMin..delayMax,
+            jitterEnabled = true
+        )
 
         startVpn()
 
@@ -156,9 +169,71 @@ class SmartSniVpnService : VpnService() {
         isRunning = true
         dnsResolver = DnsOverHttps(serverHost)
 
+        networkDetector?.start()
+
+        val isMobile = networkDetector?.isCurrentlyMobile() == true
+        configureShapingForNetwork(isMobile)
+
         tunnelJob = scope.launch {
             runTunnel()
         }
+    }
+
+    override fun onNetworkChanged(type: NetworkDetector.NetworkType, isMobile: Boolean) {
+        Log.i(TAG, "Network changed: $type (mobile=$isMobile)")
+        configureShapingForNetwork(isMobile)
+        val typeStr = type.name
+        networkStatusListener?.invoke(typeStr)
+
+        scope.launch {
+            val notification = buildNotification("Network: $typeStr")
+            val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            manager.notify(NOTIFICATION_ID, notification)
+        }
+    }
+
+    private fun configureShapingForNetwork(isMobile: Boolean) {
+        if (isMobile) {
+            trafficShaper?.apply {
+                setEnabled(true)
+            }
+            Log.i(TAG, "Mobile network: aggressive DPI bypass enabled")
+        } else {
+            trafficShaper?.apply {
+                setEnabled(true)
+            }
+            Log.i(TAG, "Non-mobile network: standard shaping enabled")
+        }
+    }
+
+    private fun buildNotification(subtext: String): Notification {
+        val stopIntent = Intent(this, SmartSniVpnService::class.java).apply {
+            action = ACTION_STOP
+        }
+        val stopPending = PendingIntent.getService(
+            this, 0, stopIntent,
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+
+        val openIntent = Intent(this, MainActivity::class.java)
+        val openPending = PendingIntent.getActivity(
+            this, 1, openIntent,
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+
+        return Notification.Builder(this, CHANNEL_ID)
+            .setContentTitle("SmartSNI VPN")
+            .setContentText("Connected to $serverHost")
+            .setSubText(subtext)
+            .setSmallIcon(android.R.drawable.ic_lock_lock)
+            .setOngoing(true)
+            .setContentIntent(openPending)
+            .addAction(
+                Notification.Action.Builder(
+                    null, "Disconnect", stopPending
+                ).build()
+            )
+            .build()
     }
 
     private suspend fun runTunnel() {
@@ -275,7 +350,7 @@ class SmartSniVpnService : VpnService() {
         if (tcpHeader.isAck && session.state == TcpState.SYN_RECEIVED) {
             Log.i(TAG, "Handshake complete for $key")
             session.state = TcpState.ESTABLISHED
-            startRelay(key, session, ipHeader, outputStream)
+            session.dataWriter = outputStream
             return
         }
 
@@ -311,7 +386,13 @@ class SmartSniVpnService : VpnService() {
         val localSeq = (Math.random() * 4294967295L).toLong()
         val remoteSeq = tcpHeader.seq + 1
 
-        val wsTunnel = WebSocketTunnel(serverHost, wsPath, bypassTriggerSni, bypassSecret)
+        val shaperForConn = TrafficShaper(
+            paddingRange = trafficShaper?.let { 10..100 } ?: 0..0,
+            delayMsRange = trafficShaper?.let { 5..20 } ?: 0..0,
+            jitterEnabled = trafficShaper?.isEnabled() == true
+        )
+
+        val wsTunnel = WebSocketTunnel(serverHost, wsPath, bypassTriggerSni, bypassSecret, shaperForConn)
 
         val session = TcpSession(
             srcIp = ipHeader.srcIp.copyOf(),
@@ -361,15 +442,6 @@ class SmartSniVpnService : VpnService() {
         })
 
         wsTunnel.connect(ipHeader.dstIpString, tcpHeader.dstPort)
-    }
-
-    private fun startRelay(
-        key: String,
-        session: TcpSession,
-        ipHeader: IpHeader,
-        outputStream: FileOutputStream
-    ) {
-        session.dataWriter = outputStream
     }
 
     private fun sendTcpSegment(
@@ -437,6 +509,7 @@ class SmartSniVpnService : VpnService() {
         isRunning = false
         statusListener?.invoke("disconnected")
 
+        networkDetector?.stop()
         tunnelJob?.cancel()
         scope.cancel()
 

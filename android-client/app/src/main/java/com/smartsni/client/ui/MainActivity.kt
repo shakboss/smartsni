@@ -13,10 +13,8 @@ import androidx.lifecycle.lifecycleScope
 import com.google.android.material.textfield.TextInputEditText
 import com.smartsni.client.R
 import com.smartsni.client.vpn.SmartSniVpnService
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 
 class MainActivity : AppCompatActivity() {
 
@@ -77,6 +75,10 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+        SmartSniVpnService.networkStatusListener = { networkType ->
+            appendLog("Network: $networkType")
+        }
+
         updateUI(SmartSniVpnService.isRunning)
     }
 
@@ -115,12 +117,18 @@ class MainActivity : AppCompatActivity() {
         isConnecting = true
         updateUI(false, connecting = true)
         appendLog("Starting VPN...")
+        appendLog("DPI bypass: enabled (padding + delays)")
+        appendLog("DNS: DoH via SmartSNI")
 
         val intent = Intent(this, SmartSniVpnService::class.java).apply {
             putExtra("server_host", serverHostInput.text.toString().trim())
             putExtra("ws_path", wsPathInput.text.toString().trim())
             putExtra("bypass_secret", secretInput.text.toString().trim())
             putExtra("trigger_sni", triggerSniInput.text.toString().trim())
+            putExtra("pad_min", 10)
+            putExtra("pad_max", 100)
+            putExtra("delay_min", 5)
+            putExtra("delay_max", 20)
         }
 
         startForegroundService(intent)
@@ -131,6 +139,7 @@ class MainActivity : AppCompatActivity() {
             updateUI(SmartSniVpnService.isRunning)
             if (SmartSniVpnService.isRunning) {
                 appendLog("VPN connected")
+                appendLog("Traffic shaping active")
             } else {
                 appendLog("VPN failed to start")
             }

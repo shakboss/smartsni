@@ -5,8 +5,7 @@ import okhttp3.*
 import okio.ByteString
 import okio.ByteString.Companion.toByteString
 import java.io.ByteArrayOutputStream
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
+import java.security.SecureRandom
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -14,7 +13,8 @@ class WebSocketTunnel(
     private val serverHost: String,
     private val wsPath: String,
     private val bypassTriggerSni: String,
-    private val bypassSecret: String?
+    private val bypassSecret: String?,
+    private val trafficShaper: TrafficShaper? = null
 ) {
 
     interface Listener {
@@ -27,11 +27,7 @@ class WebSocketTunnel(
     private var webSocket: WebSocket? = null
     private var listener: Listener? = null
     private val connected = AtomicBoolean(false)
-    private val socks5State = Socks5State.NONE
-
-    private enum class Socks5State {
-        NONE, HELLO_SENT, METHOD_SELECTED, CONNECT_SENT, READY
-    }
+    private val random = SecureRandom()
 
     private var pendingTargetHost: String = ""
     private var pendingTargetPort: Int = 0
@@ -55,7 +51,14 @@ class WebSocketTunnel(
         val builder = Request.Builder()
             .url(url)
             .header("Host", bypassTriggerSni)
-            .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+            .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+            .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+            .header("Accept-Language", "en-US,en;q=0.9")
+            .header("Accept-Encoding", "gzip, deflate, br")
+            .header("Connection", "Upgrade")
+            .header("Upgrade", "websocket")
+            .header("Sec-WebSocket-Version", "13")
+            .header("Sec-WebSocket-Key", generateWebSocketKey())
 
         if (!bypassSecret.isNullOrEmpty()) {
             builder.header("Authorization", "Bearer $bypassSecret")
@@ -67,7 +70,11 @@ class WebSocketTunnel(
             }
 
             override fun onMessage(ws: WebSocket, bytes: ByteString) {
-                handleServerData(bytes.toByteArray())
+                val rawData = bytes.toByteArray()
+                val data = if (trafficShaper?.isEnabled() == true) {
+                    trafficShaper.stripFrameNoise(rawData)
+                } else rawData
+                handleServerData(data)
             }
 
             override fun onMessage(ws: WebSocket, text: String) {
@@ -133,10 +140,10 @@ class WebSocketTunnel(
     private fun sendSocks5Connect() {
         val hostBytes = pendingTargetHost.toByteArray(Charsets.US_ASCII)
         val buf = ByteArrayOutputStream()
-        buf.write(0x05) // VER
-        buf.write(0x01) // CMD: CONNECT
-        buf.write(0x00) // RSV
-        buf.write(0x03) // ATYP: Domain
+        buf.write(0x05)
+        buf.write(0x01)
+        buf.write(0x00)
+        buf.write(0x03)
         buf.write(hostBytes.size)
         buf.write(hostBytes)
         buf.write((pendingTargetPort shr 8) and 0xFF)
@@ -151,7 +158,9 @@ class WebSocketTunnel(
         if (!connected.get()) return false
         val ws = webSocket ?: return false
         return try {
-            ws.send(data.toByteString(0, data.size))
+            val shaped = trafficShaper?.shapeOutgoing(data) ?: TrafficShaper.ShapedData(data, 0)
+            val framed = trafficShaper?.addFrameNoise(shaped.payload) ?: data
+            ws.send(framed.toByteString(0, framed.size))
             true
         } catch (e: Exception) {
             Log.e("WS-Tunnel", "Send failed: ${e.message}")
@@ -166,4 +175,10 @@ class WebSocketTunnel(
     }
 
     fun isConnected(): Boolean = connected.get()
+
+    private fun generateWebSocketKey(): String {
+        val key = ByteArray(16)
+        random.nextBytes(key)
+        return android.util.Base64.encodeToString(key, android.util.Base64.NO_WRAP)
+    }
 }
