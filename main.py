@@ -526,8 +526,9 @@ def _sni_callback(ssl_sock, server_name, ssl_context):
     try:
         peer = ssl_sock.getpeername()
         state.sni_map[peer] = server_name
-    except Exception:
-        pass
+        logging.debug(f"SNI callback: stored {server_name} for peer {peer} (fd={ssl_sock.fileno()})")
+    except Exception as e:
+        logging.error(f"SNI callback error: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -682,6 +683,7 @@ async def handle_connection(client_reader: asyncio.StreamReader, client_writer: 
         sock = transport.get_extra_info("socket")
         if sock:
             server_name = state.sni_map.pop(peer_addr, None)
+            logging.debug(f"Handle connection: looking for peer {peer_addr}, got {server_name}, keys={list(state.sni_map.keys())}")
             if not server_name:
                 server_name = getattr(sock, '_smart_sni', None)
 
