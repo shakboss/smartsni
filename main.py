@@ -677,10 +677,13 @@ async def handle_connection(client_reader: asyncio.StreamReader, client_writer: 
     logging.debug(f"New TLS connection from {peer_addr}")
 
     try:
-        transport = client_writer.transport
-        sock = transport.get_extra_info("socket")
-        if sock:
-            server_name = getattr(sock, '_smart_sni', None) or state.sni_map.pop(sock.fileno(), None)
+        ssl_obj = client_writer.transport.get_extra_info("ssl_object")
+        if ssl_obj:
+            server_name = ssl_obj.server_name
+        if not server_name:
+            sock = client_writer.transport.get_extra_info("socket")
+            if sock:
+                server_name = getattr(sock, '_smart_sni', None) or state.sni_map.pop(sock.fileno(), None)
 
         if not server_name:
             logging.warning("SNI not found. Closing.")
