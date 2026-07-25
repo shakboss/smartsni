@@ -742,10 +742,11 @@ class TLSBridge:
     """Bridges asyncio streams through an ssl.SSLObject using MemoryBIO."""
 
     def __init__(self, ssl_context: ssl.SSLContext, client_reader: asyncio.StreamReader,
-                 client_writer: asyncio.StreamWriter):
+                 client_writer: asyncio.StreamWriter, initial_data: bytes = b""):
         self._ssl_context = ssl_context
         self._client_reader = client_reader
         self._client_writer = client_writer
+        self._initial_data = initial_data
         self._bio_in = ssl.MemoryBIO()
         self._bio_out = ssl.MemoryBIO()
         self._ssl_obj: Optional[ssl.SSLObject] = None
@@ -766,7 +767,9 @@ class TLSBridge:
 
         self._ssl_obj.set_servername_callback(_sni_cb)
 
-        writer_task = asyncio.create_task(self._write_to_client())
+        if self._initial_data:
+            self._bio_in.write(self._initial_data)
+
         try:
             while True:
                 out = self._bio_out.read()
@@ -789,8 +792,6 @@ class TLSBridge:
         except Exception as e:
             logging.warning(f"TLS handshake failed: {e}")
             return None
-        finally:
-            writer_task.cancel()
 
         out = self._bio_out.read()
         if out:
@@ -836,14 +837,16 @@ async def handle_connection(client_reader: asyncio.StreamReader, client_writer: 
     bridge = None
     try:
         header = await asyncio.wait_for(client_reader.readexactly(5), timeout=5.0)
-        if header[0] != 0x16 or len(header) < 6 or header[5] != 0x01:
-            logging.warning("Not a TLS ClientHello. Closing.")
+        if header[0] != 0x16:
+            logging.warning("Not a TLS record. Closing.")
             client_writer.close()
             return
 
         record_len = int.from_bytes(header[1:3], "big")
         body = await asyncio.wait_for(client_reader.readexactly(record_len), timeout=5.0)
-        server_name = parse_sni(header + body)
+        full_record = header + body
+
+        server_name = parse_sni(full_record)
 
         if not server_name:
             logging.warning("SNI not found in ClientHello. Closing.")
@@ -858,7 +861,7 @@ async def handle_connection(client_reader: asyncio.StreamReader, client_writer: 
             client_writer.close()
             return
 
-        bridge = TLSBridge(ssl_ctx, client_reader, client_writer)
+        bridge = TLSBridge(ssl_ctx, client_reader, client_writer, initial_data=full_record)
         handshake_name = await bridge.do_handshake()
         if handshake_name:
             server_name = handshake_name
