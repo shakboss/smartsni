@@ -524,7 +524,7 @@ async def handle_socks5_handshake(reader: asyncio.StreamReader, writer: asyncio.
 # ---------------------------------------------------------------------------
 def _sni_callback(ssl_sock, server_name, ssl_context):
     try:
-        state.sni_map[ssl_sock.fileno()] = server_name
+        ssl_sock._smart_sni = server_name
     except Exception:
         pass
 
@@ -680,7 +680,7 @@ async def handle_connection(client_reader: asyncio.StreamReader, client_writer: 
         transport = client_writer.transport
         sock = transport.get_extra_info("socket")
         if sock:
-            server_name = state.sni_map.pop(sock.fileno(), None)
+            server_name = getattr(sock, '_smart_sni', None) or state.sni_map.pop(sock.fileno(), None)
 
         if not server_name:
             logging.warning("SNI not found. Closing.")
