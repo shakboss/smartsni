@@ -48,6 +48,7 @@ class SmartSniVpnService : VpnService(), NetworkDetector.Listener {
     private var dnsResolver: DnsOverHttps? = null
     private var networkDetector: NetworkDetector? = null
     private var trafficShaper: TrafficShaper? = null
+    private var domainManager: DomainManager? = null
 
     private val tcpConnections = ConcurrentHashMap<String, TcpSession>()
 
@@ -101,6 +102,10 @@ class SmartSniVpnService : VpnService(), NetworkDetector.Listener {
             delayMsRange = delayMin..delayMax,
             jitterEnabled = true
         )
+
+        domainManager = DomainManager(this).apply {
+            loadFromPrefs()
+        }
 
         startVpn()
 
@@ -165,6 +170,13 @@ class SmartSniVpnService : VpnService(), NetworkDetector.Listener {
 
         isRunning = true
         dnsResolver = DnsOverHttps(serverHost)
+
+        domainManager?.let { dm ->
+            dm.loadFromPrefs()
+            if (dm.getAllDomains().isEmpty()) {
+                dm.saveToPrefs(serverHost, emptyList(), null)
+            }
+        }
 
         networkDetector?.start()
 
@@ -388,7 +400,10 @@ class SmartSniVpnService : VpnService(), NetworkDetector.Listener {
             jitterEnabled = trafficShaper?.isEnabled() == true
         )
 
-        val wsTunnel = WebSocketTunnel(serverHost, wsPath, bypassTriggerSni, bypassSecret, shaperForConn)
+        val frontingConfig = domainManager?.getFrontingConfig()
+        val fallbackHosts = domainManager?.getFallbackDomains() ?: emptyList()
+
+        val wsTunnel = WebSocketTunnel(serverHost, wsPath, bypassTriggerSni, bypassSecret, shaperForConn, frontingConfig, fallbackHosts)
 
         val session = TcpSession(
             srcIp = ipHeader.srcIp.copyOf(),

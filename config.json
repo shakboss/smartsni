@@ -5,6 +5,22 @@
     "youtube": "190.83.181.12",
     "google": "190.83.181.12"
   },
+  "trigger_domains": [
+    "mail.shaktt.xyz",
+    "cdn.shaktt.xyz"
+  ],
+  "domain_rotation_minutes": 60,
+  "cloudflare": {
+    "enabled": false,
+    "zone_id": "",
+    "api_token": ""
+  },
+  "domain_fronting": {
+    "enabled": false,
+    "front_host": "cdn.jsdelivr.net",
+    "front_sni": "cdn.jsdelivr.net",
+    "upstream_host": "mail.shaktt.xyz"
+  },
   "bypass_settings": {
     "enabled": true,
     "mode": "websocket",

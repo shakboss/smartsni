@@ -12,6 +12,7 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.lifecycle.lifecycleScope
 import com.google.android.material.textfield.TextInputEditText
 import com.smartsni.client.R
+import com.smartsni.client.network.DomainManager
 import com.smartsni.client.vpn.SmartSniVpnService
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -23,6 +24,10 @@ class MainActivity : AppCompatActivity() {
     private lateinit var wsPathInput: TextInputEditText
     private lateinit var secretInput: TextInputEditText
     private lateinit var triggerSniInput: TextInputEditText
+    private lateinit var fallbackDomainsInput: TextInputEditText
+    private lateinit var frontHostInput: TextInputEditText
+    private lateinit var frontSniInput: TextInputEditText
+    private lateinit var upstreamHostInput: TextInputEditText
     private lateinit var connectButton: Button
     private lateinit var statusText: TextView
     private lateinit var logText: TextView
@@ -51,6 +56,10 @@ class MainActivity : AppCompatActivity() {
         wsPathInput = findViewById(R.id.wsPathInput)
         secretInput = findViewById(R.id.secretInput)
         triggerSniInput = findViewById(R.id.triggerSniInput)
+        fallbackDomainsInput = findViewById(R.id.fallbackDomainsInput)
+        frontHostInput = findViewById(R.id.frontHostInput)
+        frontSniInput = findViewById(R.id.frontSniInput)
+        upstreamHostInput = findViewById(R.id.upstreamHostInput)
         connectButton = findViewById(R.id.connectButton)
         statusText = findViewById(R.id.statusText)
         logText = findViewById(R.id.logText)
@@ -92,14 +101,38 @@ class MainActivity : AppCompatActivity() {
         wsPathInput.setText(prefs.getString("ws_path", "/wstunnel"))
         secretInput.setText(prefs.getString("secret", ""))
         triggerSniInput.setText(prefs.getString("trigger_sni", "mail.shaktt.xyz"))
+        fallbackDomainsInput.setText(prefs.getString("trigger_domains", "").replace(
+            prefs.getString("trigger_sni", "") ?: "", ""
+        ).removePrefix(",").trim())
+        frontHostInput.setText(prefs.getString("front_host", ""))
+        frontSniInput.setText(prefs.getString("front_sni", ""))
+        upstreamHostInput.setText(prefs.getString("upstream_host", ""))
     }
 
     private fun saveConfig() {
+        val triggerSni = triggerSniInput.text.toString().trim()
+        val fallback = fallbackDomainsInput.text.toString().trim()
+        val allDomains = if (fallback.isNotBlank()) {
+            "$triggerSni,$fallback"
+        } else {
+            triggerSni
+        }
+
+        val frontHost = frontHostInput.text.toString().trim()
+        val frontSni = frontSniInput.text.toString().trim()
+        val upstreamHost = upstreamHostInput.text.toString().trim()
+        val frontingEnabled = frontHost.isNotBlank() && frontSni.isNotBlank()
+
         prefs.edit().apply {
             putString("server_host", serverHostInput.text.toString().trim())
             putString("ws_path", wsPathInput.text.toString().trim())
             putString("secret", secretInput.text.toString().trim())
-            putString("trigger_sni", triggerSniInput.text.toString().trim())
+            putString("trigger_sni", triggerSni)
+            putString("trigger_domains", allDomains)
+            putBoolean("fronting_enabled", frontingEnabled)
+            putString("front_host", frontHost)
+            putString("front_sni", frontSni)
+            putString("upstream_host", upstreamHost)
             apply()
         }
     }
@@ -181,6 +214,10 @@ class MainActivity : AppCompatActivity() {
         wsPathInput.isEnabled = enabled
         secretInput.isEnabled = enabled
         triggerSniInput.isEnabled = enabled
+        fallbackDomainsInput.isEnabled = enabled
+        frontHostInput.isEnabled = enabled
+        frontSniInput.isEnabled = enabled
+        upstreamHostInput.isEnabled = enabled
     }
 
     private fun appendLog(message: String) {

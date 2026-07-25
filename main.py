@@ -48,6 +48,23 @@ class BypassSettings:
         self.bypass_secret = data.get("bypass_secret", None)
         self.socks_port = data.get("socks_port", 1080)
 
+class DomainFrontingSettings:
+    def __init__(self, data: Dict[str, Any]):
+        self.enabled = data.get("enabled", False)
+        self.front_host = data.get("front_host", "")
+        self.front_sni = data.get("front_sni", "")
+        self.upstream_host = data.get("upstream_host", "")
+
+class CloudflareSettings:
+    def __init__(self, data: Dict[str, Any]):
+        self.enabled = data.get("enabled", False)
+        self.zone_id = data.get("zone_id", "")
+        self.api_token = data.get("api_token", "")
+
+# Domain rotation state
+active_trigger_domain_index = 0
+domain_rotation_task = None
+
 
 async def load_config(filename: str) -> (Dict[str, Any], Optional[geoip2.database.Reader]):
     """Loads config and associated resources."""
@@ -94,6 +111,38 @@ async def reload_config_periodically():
                 config = new_config_data
                 geoip_reader = new_geoip_reader
             logging.info("Configuration reloaded successfully.")
+
+
+async def rotate_domains():
+    """Periodically rotates the active trigger domain."""
+    global active_trigger_domain_index
+    while True:
+        await asyncio.sleep(60)
+
+        async with config_lock:
+            domains = config.get("trigger_domains", [])
+            rotation_minutes = config.get("domain_rotation_minutes", 60)
+
+        if len(domains) <= 1:
+            continue
+
+        await asyncio.sleep(rotation_minutes * 60)
+
+        async with config_lock:
+            domains = config.get("trigger_domains", [])
+            if domains:
+                active_trigger_domain_index = (active_trigger_domain_index + 1) % len(domains)
+                new_domain = domains[active_trigger_domain_index]
+                config["bypass_settings"]["trigger_sni"] = new_domain
+                logging.info(f"Domain rotated to: {new_domain}")
+
+
+async def get_active_trigger_domain() -> str:
+    async with config_lock:
+        domains = config.get("trigger_domains", [])
+        if domains:
+            return domains[active_trigger_domain_index % len(domains)]
+        return config.get("bypass_settings", {}).get("trigger_sni", "")
 
 
 # --- DNS Logic ---
@@ -402,9 +451,14 @@ async def handle_connection(client_reader: asyncio.StreamReader, client_writer: 
             current_host = config.get("host", "")
             bypass_settings_data = config.get("bypass_settings")
             bypass = BypassSettings(bypass_settings_data) if bypass_settings_data else None
+            trigger_domains = config.get("trigger_domains", [])
 
         if bypass and bypass.enabled:
-            if bypass.trigger_sni and server_name.lower() == bypass.trigger_sni.lower():
+            sni_lower = server_name.lower()
+            is_trigger = sni_lower == bypass.trigger_sni.lower() or any(
+                sni_lower == td.lower() for td in trigger_domains
+            )
+            if is_trigger:
                 use_bypass = True
             elif bypass.detect_mobile_networks and geoip_reader:
                 peer_addr = client_writer.get_extra_info('peername')
@@ -578,6 +632,10 @@ async def websocket_handler(websocket: WebSocket, full_path: str):
     async with config_lock:
         bypass_settings_data = config.get("bypass_settings")
         bypass = BypassSettings(bypass_settings_data) if bypass_settings_data else None
+        fronting_data = config.get("domain_fronting", {})
+        fronting = DomainFrontingSettings(fronting_data) if fronting_data else None
+        cf_data = config.get("cloudflare", {})
+        cf = CloudflareSettings(cf_data) if cf_data else None
 
     if not (bypass and bypass.enabled and bypass.mode == "websocket"):
         await websocket.close(code=4004)
@@ -588,12 +646,26 @@ async def websocket_handler(websocket: WebSocket, full_path: str):
         await websocket.close(code=4004)
         return
 
+    # Domain fronting: check X-Forwarded-Host for the real upstream target
+    effective_host = websocket.headers.get("Host", "")
+    forwarded_host = websocket.headers.get("X-Forwarded-Host", "")
+    if fronting and fronting.enabled and forwarded_host:
+        effective_host = forwarded_host
+        logging.info(f"Domain fronting: Host={effective_host}, Front={websocket.headers.get('Host')}")
+
+    # Cloudflare: trust CF-Connecting-IP for real client IP
+    real_client_ip = None
+    if cf and cf.enabled:
+        cf_ip = websocket.headers.get("CF-Connecting-IP")
+        if cf_ip:
+            real_client_ip = cf_ip
+
     # 1. Authentication
     if bypass.bypass_secret:
         auth_header = websocket.headers.get("Authorization")
         if not auth_header or auth_header != f"Bearer {bypass.bypass_secret}":
             logging.warning(f"WebSocket bypass: Failed authentication for path /{full_path}")
-            await websocket.close(code=4001) # Unauthorized
+            await websocket.close(code=4001)
             return
 
     await websocket.accept()
@@ -655,6 +727,7 @@ async def main():
     geoip_reader = initial_geoip
 
     asyncio.create_task(reload_config_periodically())
+    asyncio.create_task(rotate_domains())
     asyncio.create_task(start_dot_server())
     asyncio.create_task(start_sni_proxy())
 

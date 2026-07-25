@@ -10,11 +10,13 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
 class WebSocketTunnel(
-    private val serverHost: String,
+    private var serverHost: String,
     private val wsPath: String,
     private val bypassTriggerSni: String,
     private val bypassSecret: String?,
-    private val trafficShaper: TrafficShaper? = null
+    private val trafficShaper: TrafficShaper? = null,
+    private val frontingConfig: DomainManager.FrontingConfig? = null,
+    private val fallbackHosts: List<String> = emptyList()
 ) {
 
     interface Listener {
@@ -32,6 +34,8 @@ class WebSocketTunnel(
 
     private var pendingTargetHost: String = ""
     private var pendingTargetPort: Int = 0
+    private var currentFallbackIndex = 0
+    private var isRetrying = false
 
     private val client: OkHttpClient
 
@@ -61,12 +65,26 @@ class WebSocketTunnel(
         pendingTargetPort = targetPort
 
         val randomizedPath = randomizePath(wsPath)
-        val url = "wss://$serverHost$randomizedPath"
-        Log.i("WS-Tunnel", "Connecting to $url for $targetHost:$targetPort")
+
+        val url: String
+        val hostHeader: String
+        val sniHost: String
+
+        if (frontingConfig != null && frontingConfig.frontHost.isNotBlank()) {
+            url = "wss://${frontingConfig.frontHost}$randomizedPath"
+            hostHeader = frontingConfig.upstreamHost.ifBlank { bypassTriggerSni }
+            sniHost = frontingConfig.frontSni
+            Log.i("WS-Tunnel", "Domain fronting: URL=$url, Host=$hostHeader, SNI=$sniHost")
+        } else {
+            url = "wss://$serverHost$randomizedPath"
+            hostHeader = bypassTriggerSni
+            sniHost = serverHost
+            Log.i("WS-Tunnel", "Connecting to $url for $targetHost:$targetPort")
+        }
 
         val builder = Request.Builder()
             .url(url)
-            .header("Host", bypassTriggerSni)
+            .header("Host", hostHeader)
             .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
             .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7")
             .header("Accept-Language", "en-US,en;q=0.9")
@@ -83,6 +101,10 @@ class WebSocketTunnel(
             .header("Sec-WebSocket-Key", generateWebSocketKey())
             .header("Cache-Control", "max-age=0")
 
+        if (frontingConfig != null) {
+            builder.header("X-Forwarded-Host", bypassTriggerSni)
+        }
+
         if (!bypassSecret.isNullOrEmpty()) {
             builder.header("Authorization", "Bearer $bypassSecret")
         }
@@ -90,6 +112,7 @@ class WebSocketTunnel(
         webSocket = client.newWebSocket(builder.build(), object : WebSocketListener() {
             override fun onOpen(ws: WebSocket, response: Response) {
                 Log.i("WS-Tunnel", "WebSocket opened, waiting for server hello")
+                isRetrying = false
             }
 
             override fun onMessage(ws: WebSocket, bytes: ByteString) {
@@ -121,8 +144,18 @@ class WebSocketTunnel(
             override fun onFailure(ws: WebSocket, t: Throwable, response: Response?) {
                 stopCoverTraffic()
                 Log.e("WS-Tunnel", "Failed: ${t.message}")
-                listener?.onError(t.message ?: "Connection failed")
                 connected.set(false)
+                if (!isRetrying && currentFallbackIndex < fallbackHosts.size) {
+                    val nextHost = fallbackHosts[currentFallbackIndex++]
+                    Log.w("WS-Tunnel", "Falling back to: $nextHost")
+                    isRetrying = true
+                    serverHost = nextHost
+                    disconnect()
+                    connect(pendingTargetHost, pendingTargetPort)
+                } else {
+                    isRetrying = false
+                    listener?.onError(t.message ?: "Connection failed")
+                }
             }
         })
     }
