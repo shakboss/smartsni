@@ -1,0 +1,6 @@
+fastapi
+uvicorn[standard]
+dnspython
+httpx
+geoip2
+python-multipart
