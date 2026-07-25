@@ -89,6 +89,7 @@ class AppState:
         self.mux_sessions: Dict[str, "MuxServerSession"] = {}
         self.mux_lock = asyncio.Lock()
         self._shutting_down = False
+        self._sni_ssl_context: Optional[ssl.SSLContext] = None
 
     def cache_bypass_settings(self):
         bypass_data = self.config.get("bypass_settings")
@@ -105,7 +106,79 @@ class AppState:
         return None
 
 
-state = AppState()
+
+async def _relay_bridge_to_backend(bridge: "TLSBridge", backend_writer: asyncio.StreamWriter, settings=None):
+    total_bytes = 0
+    try:
+        while True:
+            data = await bridge.read(4096)
+            if not data:
+                break
+            data_to_write = data
+            if settings and settings.padding_size_range and settings.padding_size_range[1] > 0:
+                min_pad, max_pad = settings.padding_size_range
+                pad_size = random.randint(min_pad, max_pad)
+                data_to_write += os.urandom(pad_size)
+            backend_writer.write(data_to_write)
+            await backend_writer.drain()
+            total_bytes += len(data)
+            if settings and settings.delay_ms_range and settings.delay_ms_range[1] > 0:
+                delay = _bimodal_delay_ms(settings.delay_ms_range) / 1000.0
+                await asyncio.sleep(delay)
+    except (asyncio.IncompleteReadError, ConnectionResetError):
+        pass
+    finally:
+        logging.debug(f"bridge->backend relay: {total_bytes} bytes")
+        backend_writer.close()
+
+
+async def _relay_backend_to_bridge(backend_reader: asyncio.StreamReader, bridge: "TLSBridge", idle_timeout: int = 120):
+    total_bytes = 0
+    try:
+        while not backend_reader.at_eof():
+            try:
+                data = await asyncio.wait_for(backend_reader.read(4096), timeout=idle_timeout)
+            except asyncio.TimeoutError:
+                logging.debug(f"backend->bridge relay: idle timeout ({idle_timeout}s)")
+                break
+            if not data:
+                break
+            await bridge.write(data)
+            total_bytes += len(data)
+    except (asyncio.IncompleteReadError, ConnectionResetError):
+        pass
+    finally:
+        logging.debug(f"backend->bridge relay: {total_bytes} bytes")
+
+
+async def handle_socks5_handshake_bridge(bridge: "TLSBridge"):
+    header = await bridge.read(2)
+    if len(header) < 2 or header[0] != 0x05:
+        return None
+    nmethods = header[1]
+    await bridge.read(nmethods)
+    await bridge.write(b"\x05\x00")
+
+    req = await bridge.read(4)
+    if len(req) < 4 or req[0] != 0x05 or req[1] != 0x01:
+        return None
+    atyp = req[3]
+    if atyp == 0x01:
+        addr_data = await bridge.read(4)
+        host = ".".join(str(b) for b in addr_data)
+    elif atyp == 0x03:
+        length = (await bridge.read(1))[0]
+        host = (await bridge.read(length)).decode()
+    elif atyp == 0x04:
+        addr_data = await bridge.read(16)
+        host = ":".join(f"{addr_data[i]:02x}{addr_data[i+1]:02x}" for i in range(0, 16, 2))
+    else:
+        return None
+    port_data = await bridge.read(2)
+    port = int.from_bytes(port_data, "big")
+    return host, port
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -522,14 +595,6 @@ async def handle_socks5_handshake(reader: asyncio.StreamReader, writer: asyncio.
 # ---------------------------------------------------------------------------
 # SNI Callback
 # ---------------------------------------------------------------------------
-def _sni_callback(ssl_sock, server_name, ssl_context):
-    try:
-        peer = ssl_sock.getpeername()
-        state.sni_map[peer] = server_name
-        logging.debug(f"SNI callback: stored {server_name} for peer {peer} (fd={ssl_sock.fileno()})")
-    except Exception as e:
-        logging.error(f"SNI callback error: {e}")
-
 
 # ---------------------------------------------------------------------------
 # Multiplexer Protocol (server-side)
@@ -671,27 +736,133 @@ class MuxServerSession:
 
 
 # ---------------------------------------------------------------------------
-# SNI Proxy
+# SNI Proxy (raw TCP + manual TLS via SSLObject/MemoryBIO)
 # ---------------------------------------------------------------------------
+class TLSBridge:
+    """Bridges asyncio streams through an ssl.SSLObject using MemoryBIO."""
+
+    def __init__(self, ssl_context: ssl.SSLContext, client_reader: asyncio.StreamReader,
+                 client_writer: asyncio.StreamWriter):
+        self._ssl_context = ssl_context
+        self._client_reader = client_reader
+        self._client_writer = client_writer
+        self._bio_in = ssl.MemoryBIO()
+        self._bio_out = ssl.MemoryBIO()
+        self._ssl_obj: Optional[ssl.SSLObject] = None
+        self._handshake_complete = asyncio.Event()
+        self._closed = False
+
+    async def do_handshake(self) -> Optional[str]:
+        self._ssl_obj = ssl.SSLObject(
+            self._ssl_context, server_side=True, do_handshake_on_connect=False
+        )
+        self._ssl_obj.set_bio(self._bio_in, self._bio_out)
+
+        server_name = None
+
+        def _sni_cb(ssl_sock, sn, ctx):
+            nonlocal server_name
+            server_name = sn
+
+        self._ssl_obj.set_servername_callback(_sni_cb)
+
+        writer_task = asyncio.create_task(self._write_to_client())
+        try:
+            while True:
+                out = self._bio_out.read()
+                if out:
+                    self._client_writer.write(out)
+                    await self._client_writer.drain()
+                try:
+                    self._ssl_obj.do_handshake()
+                    break
+                except ssl.SSLWantReadError:
+                    pass
+
+                try:
+                    data = await asyncio.wait_for(self._client_reader.read(65536), timeout=5.0)
+                except asyncio.TimeoutError:
+                    return None
+                if not data:
+                    return None
+                self._bio_in.write(data)
+        except Exception as e:
+            logging.warning(f"TLS handshake failed: {e}")
+            return None
+        finally:
+            writer_task.cancel()
+
+        out = self._bio_out.read()
+        if out:
+            self._client_writer.write(out)
+            await self._client_writer.drain()
+
+        self._handshake_complete.set()
+        return server_name
+
+    async def read(self, n: int = 65536) -> bytes:
+        while True:
+            data = self._ssl_obj.read(n)
+            if data:
+                return data
+            try:
+                raw = await asyncio.wait_for(self._client_reader.read(65536), timeout=120)
+            except asyncio.TimeoutError:
+                return b""
+            if not raw:
+                return b""
+            self._bio_in.write(raw)
+            out = self._bio_out.read()
+            if out:
+                self._client_writer.write(out)
+                await self._client_writer.drain()
+
+    async def write(self, data: bytes):
+        self._ssl_obj.write(data)
+        out = self._bio_out.read()
+        if out:
+            self._client_writer.write(out)
+            await self._client_writer.drain()
+
+    def is_handshake_done(self) -> bool:
+        return self._handshake_complete.is_set()
+
+
 async def handle_connection(client_reader: asyncio.StreamReader, client_writer: asyncio.StreamWriter):
     server_name = None
     peer_addr = client_writer.get_extra_info("peername")
-    logging.debug(f"New TLS connection from {peer_addr}")
+    logging.debug(f"New TCP connection from {peer_addr}")
 
+    bridge = None
     try:
-        transport = client_writer.transport
-        sock = transport.get_extra_info("socket")
-        if sock:
-            server_name = state.sni_map.pop(peer_addr, None)
-            logging.debug(f"Handle connection: looking for peer {peer_addr}, got {server_name}, keys={list(state.sni_map.keys())}")
-            if not server_name:
-                server_name = getattr(sock, '_smart_sni', None)
+        header = await asyncio.wait_for(client_reader.readexactly(5), timeout=5.0)
+        if header[0] != 0x16 or len(header) < 6 or header[5] != 0x01:
+            logging.warning("Not a TLS ClientHello. Closing.")
+            client_writer.close()
+            return
+
+        record_len = int.from_bytes(header[1:3], "big")
+        body = await asyncio.wait_for(client_reader.readexactly(record_len), timeout=5.0)
+        server_name = parse_sni(header + body)
 
         if not server_name:
-            logging.warning(f"SNI not found for {peer_addr}. Closing.")
+            logging.warning("SNI not found in ClientHello. Closing.")
+            client_writer.close()
             return
 
         logging.info(f"SNI: {server_name}")
+
+        ssl_ctx = state._sni_ssl_context
+        if not ssl_ctx:
+            logging.error("No SSL context available")
+            client_writer.close()
+            return
+
+        bridge = TLSBridge(ssl_ctx, client_reader, client_writer)
+        handshake_name = await bridge.do_handshake()
+        if handshake_name:
+            server_name = handshake_name
+            logging.info(f"SNI (post-handshake): {server_name}")
 
         proxy_mode = "direct"
         target_host = ""
@@ -774,11 +945,11 @@ async def handle_connection(client_reader: asyncio.StreamReader, client_writer: 
             logging.info(f"Relay to {target_host}:{target_port}")
 
         if proxy_mode == "shape":
-            task1 = asyncio.create_task(shape_and_relay(client_reader, backend_writer, bypass))
-            task2 = asyncio.create_task(shape_and_relay(backend_reader, client_writer, bypass))
+            task1 = asyncio.create_task(_relay_bridge_to_backend(bridge, backend_writer, bypass))
+            task2 = asyncio.create_task(_relay_backend_to_bridge(backend_reader, bridge, idle_timeout))
         else:
-            task1 = asyncio.create_task(relay_streams(client_reader, backend_writer, idle_timeout))
-            task2 = asyncio.create_task(relay_streams(backend_reader, client_writer, idle_timeout))
+            task1 = asyncio.create_task(_relay_backend_to_bridge(backend_reader, bridge, idle_timeout))
+            task2 = asyncio.create_task(_relay_bridge_to_backend(bridge, backend_writer, bypass=None))
 
         await asyncio.gather(task1, task2)
 
@@ -813,12 +984,12 @@ async def start_sni_proxy():
         if cert_path.exists() and key_path.exists():
             ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
             ssl_context.load_cert_chain(str(cert_path), str(key_path))
-            ssl_context.set_servername_callback(_sni_callback)
             logging.info(f"SNI proxy: certs from {cert_path}")
             break
 
     if ssl_context:
-        server = await asyncio.start_server(handle_connection, "0.0.0.0", 443, ssl=ssl_context)
+        state._sni_ssl_context = ssl_context
+        server = await asyncio.start_server(handle_connection, "0.0.0.0", 443)
         logging.info("SNI proxy listening on 0.0.0.0:443")
     else:
         logging.warning("No TLS certs found. SNI proxy cannot start on port 443.")
