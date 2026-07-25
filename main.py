@@ -316,8 +316,17 @@ async def start_dot_server():
         logging.error("Cannot start DoT: 'host' not in config.")
         return
 
-    cert_path = state.config.get("dot_cert_path", f"/etc/letsencrypt/live/{host}/fullchain.pem")
-    key_path = state.config.get("dot_key_path", f"/etc/letsencrypt/live/{host}/privkey.pem")
+    install_dir = pathlib.Path(os.environ.get("INSTALL_DIR", "/opt/smartSNI"))
+    local_certs = install_dir / "certs"
+    cert_path = state.config.get("dot_cert_path", "")
+    key_path = state.config.get("dot_key_path", "")
+    if not cert_path or not os.path.exists(cert_path):
+        cert_path = str(local_certs / "fullchain.pem")
+    if not key_path or not os.path.exists(key_path):
+        key_path = str(local_certs / "privkey.pem")
+    if not os.path.exists(cert_path):
+        cert_path = f"/etc/letsencrypt/live/{host}/fullchain.pem"
+        key_path = f"/etc/letsencrypt/live/{host}/privkey.pem"
 
     if not (os.path.exists(cert_path) and os.path.exists(key_path)):
         logging.error(f"DoT TLS certs not found ({cert_path}, {key_path}). DoT will not start.")
@@ -733,8 +742,9 @@ async def handle_connection(client_reader: asyncio.StreamReader, client_writer: 
                     return
         else:
             if server_name.lower() == current_host.lower():
+                proxy_mode = "cover"
                 target_host = "127.0.0.1"
-                target_port = 853
+                target_port = 8080
             else:
                 target_host = server_name
                 target_port = 443
