@@ -44,6 +44,9 @@ class BypassSettings:
         self.detect_mobile_networks = data.get("detect_mobile_networks", False)
         self.mobile_carrier_names = data.get("mobile_carrier_names", [])
         self.geoip_db_path = data.get("geoip_db_path", "")
+        self.socks_host = data.get("socks_host", "127.0.0.1")
+        self.bypass_secret = data.get("bypass_secret", None)
+        self.socks_port = data.get("socks_port", 1080)
 
 
 async def load_config(filename: str) -> (Dict[str, Any], Optional[geoip2.database.Reader]):
@@ -125,7 +128,8 @@ async def process_dns_query(query_bytes: bytes) -> bytes:
 
         # Forward to upstream DoH
         headers = {'content-type': 'application/dns-message'}
-        resp = await doh_client.post("https://1.1.1.1/dns-query", content=query_bytes, headers=headers)
+        upstream_doh = config.get("upstream_doh", "https://1.1.1.1/dns-query")
+        resp = await doh_client.post(upstream_doh, content=query_bytes, headers=headers)
         resp.raise_for_status()
         return resp.content
 
@@ -166,11 +170,11 @@ async def start_dot_server():
         logging.error("Cannot start DoT server: 'host' not defined in config.")
         return
 
-    cert_path = f"/etc/letsencrypt/live/{host}/fullchain.pem"
-    key_path = f"/etc/letsencrypt/live/{host}/privkey.pem"
+    cert_path = config.get("dot_cert_path", f"/etc/letsencrypt/live/{host}/fullchain.pem")
+    key_path = config.get("dot_key_path", f"/etc/letsencrypt/live/{host}/privkey.pem")
 
     if not (os.path.exists(cert_path) and os.path.exists(key_path)):
-        logging.error(f"TLS certificates not found for DoT server at {cert_path}. DoT will not start.")
+        logging.error(f"TLS certificates not found for DoT server (cert: '{cert_path}', key: '{key_path}'). DoT will not start.")
         return
 
     ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
@@ -280,6 +284,31 @@ async def shape_and_relay(reader: asyncio.StreamReader, writer: asyncio.StreamWr
         writer.close()
 
 
+async def obfuscate_and_relay_ws(source_reader: asyncio.StreamReader, dest_ws: WebSocket, settings: BypassSettings):
+    """Reads from a stream, obfuscates, and sends over a WebSocket."""
+    try:
+        while not source_reader.at_eof():
+            data = await source_reader.read(2048)  # Read smaller chunks
+            if not data:
+                break
+
+            # Add random padding to the data chunk
+            if settings.padding_size_range and settings.padding_size_range[1] > 0:
+                min_pad, max_pad = settings.padding_size_range
+                padding = os.urandom(random.randint(min_pad, max_pad))
+                data += padding
+
+            await dest_ws.send_bytes(data)
+
+            # Add random delay between sending chunks
+            if settings.delay_ms_range and settings.delay_ms_range[1] > 0:
+                min_delay, max_delay = settings.delay_ms_range
+                delay = random.randint(min_delay, max_delay) / 1000.0
+                await asyncio.sleep(delay)
+    except (WebSocketDisconnect, ConnectionResetError):
+        pass
+
+
 async def relay_streams(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
     """Simple bidirectional relay."""
     try:
@@ -295,9 +324,44 @@ async def relay_streams(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
         writer.close()
 
 
+async def handle_socks5_handshake(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> Optional[tuple[str, int]]:
+    """
+    Performs a SOCKS5 handshake to get the target destination from the client.
+    Returns (host, port) on success, None on failure.
+    """
+    try:
+        # SOCKS5 handshake: VER, NMETHODS, METHODS
+        ver_nmethods = await reader.readexactly(2)
+        if ver_nmethods[0] != 0x05: return None # VER != 5
+        methods_count = ver_nmethods[1]
+        methods = await reader.readexactly(methods_count)
+        # We only support NO AUTHENTICATION REQUIRED (0x00)
+        if 0x00 not in methods: return None
+        # Send server choice: VER, METHOD
+        writer.write(b'\x05\x00')
+        await writer.drain()
+
+        # SOCKS5 request: VER, CMD, RSV, ATYP, DST.ADDR, DST.PORT
+        ver_cmd_rsv_atyp = await reader.readexactly(4)
+        if ver_cmd_rsv_atyp[0] != 0x05 or ver_cmd_rsv_atyp[1] != 0x01: return None # VER=5, CMD=1 (CONNECT)
+
+        atyp = ver_cmd_rsv_atyp[3]
+        if atyp == 0x03: # Domain name
+            domain_len = (await reader.readexactly(1))[0]
+            target_host = (await reader.readexactly(domain_len)).decode()
+        elif atyp == 0x01: # IPv4
+            target_host = ".".join(str(b) for b in await reader.readexactly(4))
+        else: # IPv6 or unsupported
+            return None
+
+        target_port = int.from_bytes(await reader.readexactly(2), 'big')
+        return target_host, target_port
+    except (asyncio.IncompleteReadError, ConnectionResetError, UnicodeDecodeError):
+        return None
+
 async def handle_connection(client_reader: asyncio.StreamReader, client_writer: asyncio.StreamWriter):
     """Main entry point for incoming connections on port 443."""
-    peek_buffer = b''
+    full_client_hello = b''
     server_name = None
     try:
         # 1. Read the 5-byte TLS record header to get the length of the ClientHello.
@@ -312,9 +376,9 @@ async def handle_connection(client_reader: asyncio.StreamReader, client_writer: 
         record_body = await asyncio.wait_for(client_reader.readexactly(record_len), timeout=5.0)
 
         # 3. We now have the full ClientHello packet.
-        peek_buffer = header + record_body
+        full_client_hello = header + record_body
 
-        server_name = parse_sni(peek_buffer)
+        server_name = parse_sni(full_client_hello)
 
         if not server_name:
             logging.warning("SNI not found or could not be parsed. Closing connection.")
@@ -359,12 +423,26 @@ async def handle_connection(client_reader: asyncio.StreamReader, client_writer: 
                 proxy_mode = "websocket_forward"
                 target_host = "127.0.0.1"
                 target_port = 8080  # Internal FastAPI/Uvicorn server
-                logging.info(f"WebSocket bypass activated for SNI: {server_name}")
-            else:  # shape mode
-                proxy_mode = "shape"
-                target_host = server_name
-                target_port = 443
-                logging.info(f"Shape bypass activated for SNI: {server_name}")
+                logging.info(f"Bypass: WebSocket mode activated for SNI: {server_name}")
+            else:  # 'shape' mode for TLS-in-TLS
+                # The 'shape' mode with a trigger_sni implies a SOCKS5 handshake will be sent by the client
+                # inside the TLS tunnel to specify the real destination.
+                try:
+                    socks_target = await handle_socks5_handshake(client_reader, client_writer)
+                    if not socks_target:
+                        logging.warning(f"SOCKS5 handshake failed for SNI {server_name}")
+                        return
+                    target_host, target_port = socks_target
+
+                    # Send reply: VER, REP, RSV, ATYP, BND.ADDR, BND.PORT
+                    client_writer.write(b'\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00')
+                    await client_writer.drain()
+
+                    proxy_mode = "shape"
+                    logging.info(f"Bypass: Shape/SOCKS mode activated for SNI: {server_name} -> {target_host}:{target_port}")
+                except (asyncio.IncompleteReadError, ConnectionResetError):
+                    return # Client disconnected during SOCKS handshake
+
         else:  # direct proxy
             if server_name.lower() == current_host.lower():
                 target_host = "127.0.0.1"
@@ -373,14 +451,22 @@ async def handle_connection(client_reader: asyncio.StreamReader, client_writer: 
                 target_host = server_name
                 target_port = 443
 
+        if proxy_mode == "shape" and not use_bypass:
+            # This is the mobile-detect case for 'shape' mode. The target is the SNI itself.
+            target_host = server_name
+            target_port = 443
+            logging.info(f"Bypass: Shape mode activated for mobile network -> {target_host}:{target_port}")
+
         backend_reader, backend_writer = await asyncio.open_connection(target_host, target_port)
-        backend_writer.write(peek_buffer)
+        backend_writer.write(full_client_hello)
         await backend_writer.drain()
 
         if proxy_mode == "shape":
+            # Relay with obfuscation
             task1 = asyncio.create_task(shape_and_relay(client_reader, backend_writer, bypass))
             task2 = asyncio.create_task(shape_and_relay(backend_reader, client_writer, bypass))
         else:  # direct and websocket_forward
+            # Simple relay without obfuscation
             task1 = asyncio.create_task(relay_streams(client_reader, backend_writer))
             task2 = asyncio.create_task(relay_streams(backend_reader, client_writer))
 
@@ -431,59 +517,62 @@ async def websocket_handler(websocket: WebSocket, full_path: str):
         bypass = BypassSettings(bypass_settings_data) if bypass_settings_data else None
 
     if not (bypass and bypass.enabled and bypass.mode == "websocket" and f"/{full_path}" == bypass.tunnel_path):
-        await websocket.close(code=1008)  # Policy Violation
+        await websocket.close(code=4004)
         return
+
+    # 1. Authentication
+    if bypass.bypass_secret:
+        auth_header = websocket.headers.get("Authorization")
+        if not auth_header or auth_header != f"Bearer {bypass.bypass_secret}":
+            logging.warning(f"WebSocket bypass: Failed authentication for path /{full_path}")
+            await websocket.close(code=4001) # Unauthorized
+            return
 
     await websocket.accept()
+    logging.info(f"WebSocket bypass: Client authenticated and connected successfully.")
 
-    target = websocket.headers.get("Bypass-Target")
-    if not target:
-        logging.warning("WebSocket bypass: Missing Bypass-Target header")
-        await websocket.close(code=1008)
-        return
+    # 2. Send a welcome message to confirm protocol framing
+    await websocket.send_json({"type": "hello", "status": "connected"})
+
+
+    # --- MODIFICATION FOR VPN/SOCKS CLIENT ---
+    # Instead of reading a target from a header, we forward all traffic
+    # from this WebSocket to a local SOCKS5 proxy server.
+    # These settings are now configurable in config.json
+    socks_host = bypass.socks_host
+    socks_port = bypass.socks_port
+    target_log_name = f"{socks_host}:{socks_port} (SOCKS Proxy)"
+    # --- END MODIFICATION ---
 
     try:
-        host, port_str = target.split(":")
-        port = int(port_str)
-    except ValueError:
-        logging.warning(f"WebSocket bypass: Invalid Bypass-Target format: {target}")
-        await websocket.close(code=1008)
-        return
+        reader, writer = await asyncio.open_connection(socks_host, socks_port)
+        logging.info(f"WebSocket bypass: Tunneling to {target_log_name}")
 
-    try:
-        reader, writer = await asyncio.open_connection(host, port)
-        logging.info(f"WebSocket bypass: Tunneling to {target}")
-
-        async def ws_to_tcp(ws: WebSocket, tcp_writer: asyncio.StreamWriter):
+        # This direction (client -> server) doesn't need obfuscation,
+        # as the client-side will handle that. We just relay binary frames.
+        async def ws_to_socks(ws: WebSocket, socks_writer: asyncio.StreamWriter):
             try:
                 while True:
                     data = await ws.receive_bytes()
-                    tcp_writer.write(data)
-                    await tcp_writer.drain()
+                    if data:
+                        socks_writer.write(data)
+                        await socks_writer.drain()
             except WebSocketDisconnect:
                 pass
             finally:
-                tcp_writer.close()
+                socks_writer.close()
 
-        async def tcp_to_ws(tcp_reader: asyncio.StreamReader, ws: WebSocket):
-            try:
-                while not tcp_reader.at_eof():
-                    data = await tcp_reader.read(4096)
-                    if not data: break
-                    await ws.send_bytes(data)
-            except (WebSocketDisconnect, ConnectionResetError):
-                pass
-            finally:
-                await ws.close()
+        task_c2s = asyncio.create_task(ws_to_socks(websocket, writer))
 
-        task1 = asyncio.create_task(ws_to_tcp(websocket, writer))
-        task2 = asyncio.create_task(tcp_to_ws(reader, websocket))
-        await asyncio.gather(task1, task2)
+        # Relay from SOCKS to WebSocket, applying traffic shaping for camouflage.
+        task_s2c = asyncio.create_task(obfuscate_and_relay_ws(reader, websocket, bypass))
+
+        await asyncio.gather(task_c2s, task_s2c)
 
     except Exception as e:
-        logging.error(f"WebSocket bypass error for target {target}: {e}")
+        logging.error(f"WebSocket bypass error for target {target_log_name}: {e}")
     finally:
-        logging.info(f"WebSocket bypass: Tunnel to {target} closed")
+        logging.info(f"WebSocket bypass: Tunnel to {target_log_name} closed")
 
 
 # --- Main Entry Point ---

@@ -7,11 +7,14 @@
   },
   "bypass_settings": {
     "enabled": true,
+    "mode": "websocket",
     "trigger_sni": "mail.shaktt.xyz",
+    "tunnel_path": "/wstunnel",
+    "bypass_secret": "A9wZtP4qE7rV2sY6jK1bC3fH5gN8xU0d",
     "padding_size_range": [ 10, 100 ],
     "delay_ms_range": [ 5, 20 ],
     "detect_mobile_networks": true,
-    "geoip_db_path": "/path/to/GeoLite2-ASN.mmdb",
+    "geoip_db_path": "/opt/smartSNI/GeoLite2-ASN.mmdb",
     "mobile_carrier_names": ["at&t", "verizon", "Digicel", "bmobile"]
   }
 }
