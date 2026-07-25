@@ -3,7 +3,6 @@ package com.smartsni.client.network
 import android.os.Build
 import android.util.Log
 import java.security.SecureRandom
-import java.util.concurrent.TimeUnit
 import javax.net.ssl.SSLContext
 import javax.net.ssl.SSLSocket
 import javax.net.ssl.SSLSocketFactory
@@ -12,6 +11,12 @@ import javax.net.ssl.X509TrustManager
 object ChromeTlsFingerprint {
 
     private const val TAG = "ChromeTLS"
+
+    val trustManager = object : X509TrustManager {
+        override fun checkClientTrusted(chain: Array<out java.security.cert.X509Certificate>?, authType: String?) {}
+        override fun checkServerTrusted(chain: Array<out java.security.cert.X509Certificate>?, authType: String?) {}
+        override fun getAcceptedIssuers(): Array<java.security.cert.X509Certificate> = arrayOf()
+    }
 
     private val CHROME_CIPHER_SUITES = intArrayOf(
         0x1301, // TLS_AES_128_GCM_SHA256
@@ -30,32 +35,30 @@ object ChromeTlsFingerprint {
         0x009f, // RSA_AES_128_CBC_SHA256
         0x0035, // RSA_AES_256_CBC_SHA256
         0x0033, // RSA_AES_128_CBC_SHA
-        0x0039, // RSA_AES_256_CBC_SHA
-        0x0028, // RSA_3DES_EDE_CBC_SHA
-        0x000a  // RSA_ENCRYPT_NULL_SHA
+        0x0039  // RSA_AES_256_CBC_SHA
     )
 
-    private val CHROME_EC_CURVES = intArrayOf(
-        0x001d, // x25519
-        0x0017, // secp256r1
-        0x0018  // secp384r1
-    )
-
-    private val CHROME_SIG_ALGORITHMS = byteArrayOf(
-        0x04, 0x03, 0x08, 0x04, 0x04, 0x01,
-        0x05, 0x03, 0x08, 0x05, 0x05, 0x01,
-        0x08, 0x04, 0x04, 0x03, 0x02, 0x03,
-        0x08, 0x05, 0x05, 0x03, 0x02, 0x03,
-        0x02, 0x01, 0x01, 0x01
+    private val CIPHER_NAME_MAP = mapOf(
+        0x1301 to "TLS_AES_128_GCM_SHA256",
+        0x1302 to "TLS_AES_256_GCM_SHA384",
+        0x1303 to "TLS_CHACHA20_POLY1305_SHA256",
+        0xc02b to "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
+        0xc02f to "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+        0xc02c to "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
+        0xc030 to "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
+        0xcca9 to "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
+        0xcca8 to "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
+        0xc013 to "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA",
+        0xc014 to "TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA",
+        0x009c to "TLS_RSA_WITH_AES_128_GCM_SHA256",
+        0x009d to "TLS_RSA_WITH_AES_256_GCM_SHA384",
+        0x009f to "TLS_RSA_WITH_AES_128_CBC_SHA256",
+        0x0035 to "TLS_RSA_WITH_AES_256_CBC_SHA256",
+        0x0033 to "TLS_RSA_WITH_AES_128_CBC_SHA",
+        0x0039 to "TLS_RSA_WITH_AES_256_CBC_SHA"
     )
 
     fun createSocketFactory(): SSLSocketFactory {
-        val trustManager = object : X509TrustManager {
-            override fun checkClientTrusted(chain: Array<out java.security.cert.X509Certificate>?, authType: String?) {}
-            override fun checkServerTrusted(chain: Array<out java.security.cert.X509Certificate>?, authType: String?) {}
-            override fun getAcceptedIssuers(): Array<java.security.cert.X509Certificate> = arrayOf()
-        }
-
         val sslContext = SSLContext.getInstance("TLS")
         sslContext.init(null, arrayOf(trustManager), SecureRandom())
 
@@ -99,19 +102,8 @@ object ChromeTlsFingerprint {
         try {
             val params = sslSocket.sslParameters
 
-            params.cipherSuites = CHROME_CIPHER_SUITES.map { cipherId ->
-                when (cipherId) {
-                    0x1301 -> "TLS_AES_128_GCM_SHA256"
-                    0x1302 -> "TLS_AES_256_GCM_SHA384"
-                    0x1303 -> "TLS_CHACHA20_POLY1305_SHA256"
-                    0xc02b -> "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256"
-                    0xc02f -> "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256"
-                    0xc02c -> "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384"
-                    0xc030 -> "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384"
-                    0xcca9 -> "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256"
-                    0xcca8 -> "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256"
-                    else -> continue
-                }
+            params.cipherSuites = CHROME_CIPHER_SUITES.mapNotNull { cipherId ->
+                CIPHER_NAME_MAP[cipherId]
             }.toTypedArray()
 
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {

@@ -8,6 +8,7 @@ import java.io.ByteArrayOutputStream
 import java.security.SecureRandom
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.math.abs
 
 class WebSocketTunnel(
     private var serverHost: String,
@@ -30,26 +31,29 @@ class WebSocketTunnel(
     private var listener: Listener? = null
     private val connected = AtomicBoolean(false)
     private val random = SecureRandom()
+    private var multiplexer: Multiplexer? = null
+    private var useMultiplexing = false
 
     private var pendingTargetHost: String = ""
     private var pendingTargetPort: Int = 0
     private var currentFallbackIndex = 0
     private var isRetrying = false
 
+    // Per-connection stream ID (for legacy single-stream mode)
+    private var legacyStreamId = 1
+
     private val client: OkHttpClient
     init {
         val socketFactory = ChromeTlsFingerprint.createSocketFactory()
-        val trustManager = object : javax.net.ssl.X509TrustManager {
-            override fun checkClientTrusted(chain: Array<out java.security.cert.X509Certificate>?, authType: String?) {}
-            override fun checkServerTrusted(chain: Array<out java.security.cert.X509Certificate>?, authType: String?) {}
-            override fun getAcceptedIssuers(): Array<java.security.cert.X509Certificate> = arrayOf()
-        }
+
+        // Variable ping interval: 25-45 seconds (mimics Chrome's irregular pings)
+        val pingIntervalSec = 25 + random.nextInt(21)
 
         client = OkHttpClient.Builder()
             .readTimeout(0, TimeUnit.MILLISECONDS)
             .writeTimeout(0, TimeUnit.MILLISECONDS)
-            .pingInterval(30, TimeUnit.SECONDS)
-            .sslSocketFactory(socketFactory, trustManager)
+            .pingInterval(pingIntervalSec.toLong(), TimeUnit.SECONDS)
+            .sslSocketFactory(socketFactory, ChromeTlsFingerprint.trustManager)
             .hostnameVerifier { _, _ -> true }
             .build()
     }
@@ -66,38 +70,23 @@ class WebSocketTunnel(
 
         val url: String
         val hostHeader: String
-        val sniHost: String
 
         if (frontingConfig != null && frontingConfig.frontHost.isNotBlank()) {
             url = "wss://${frontingConfig.frontHost}$randomizedPath"
             hostHeader = frontingConfig.upstreamHost.ifBlank { bypassTriggerSni }
-            sniHost = frontingConfig.frontSni
-            Log.i("WS-Tunnel", "Domain fronting: URL=$url, Host=$hostHeader, SNI=$sniHost")
+            Log.i("WS-Tunnel", "Domain fronting: URL=$url, Host=$hostHeader")
         } else {
             url = "wss://$serverHost$randomizedPath"
             hostHeader = bypassTriggerSni
-            sniHost = serverHost
             Log.i("WS-Tunnel", "Connecting to $url for $targetHost:$targetPort")
         }
 
         val builder = Request.Builder()
             .url(url)
             .header("Host", hostHeader)
-            .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
-            .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7")
-            .header("Accept-Language", "en-US,en;q=0.9")
-            .header("Accept-Encoding", "gzip, deflate, br, zstd")
-            .header("Sec-Ch-Ua", "\"Google Chrome\";v=\"131\", \"Chromium\";v=\"131\", \"Not_A Brand\";v=\"24\"")
-            .header("Sec-Ch-Ua-Mobile", "?0")
-            .header("Sec-Ch-Ua-Platform", "\"Windows\"")
-            .header("Sec-Fetch-Dest", "websocket")
-            .header("Sec-Fetch-Mode", "navigate")
-            .header("Sec-Fetch-Site", "same-origin")
-            .header("Sec-Fetch-User", "?1")
-            .header("Upgrade", "websocket")
-            .header("Sec-WebSocket-Version", "13")
-            .header("Sec-WebSocket-Key", generateWebSocketKey())
-            .header("Cache-Control", "max-age=0")
+
+        // Varied HTTP headers (rotate order and values slightly per connection)
+        addVariedHeaders(builder)
 
         if (frontingConfig != null) {
             builder.header("X-Forwarded-Host", bypassTriggerSni)
@@ -109,7 +98,7 @@ class WebSocketTunnel(
 
         webSocket = client.newWebSocket(builder.build(), object : WebSocketListener() {
             override fun onOpen(ws: WebSocket, response: Response) {
-                Log.i("WS-Tunnel", "WebSocket opened, waiting for server hello")
+                Log.i("WS-Tunnel", "WebSocket opened, waiting for hello")
                 isRetrying = false
             }
 
@@ -120,8 +109,11 @@ class WebSocketTunnel(
             override fun onMessage(ws: WebSocket, text: String) {
                 Log.d("WS-Tunnel", "Text: $text")
                 if (text.contains("\"type\"") && text.contains("\"hello\"")) {
-                    Log.i("WS-Tunnel", "Server hello received, starting SOCKS5")
-                    sendSocks5Greeting()
+                    // Check if server supports multiplexing
+                    useMultiplexing = text.contains("\"multiplexing\":true") ||
+                            text.contains("\"multiplexing\": true")
+                    Log.i("WS-Tunnel", "Server hello: multiplexing=$useMultiplexing")
+                    startProtocol()
                 }
             }
 
@@ -155,6 +147,45 @@ class WebSocketTunnel(
         })
     }
 
+    private fun startProtocol() {
+        if (useMultiplexing) {
+            startMultiplexedMode()
+        } else {
+            startLegacyMode()
+        }
+    }
+
+    private fun startMultiplexedMode() {
+        val ws = webSocket ?: return
+        multiplexer = Multiplexer(ws, trafficShaper)
+        multiplexer?.setListener(object : Multiplexer.StreamListener {
+            override fun onStreamData(streamId: Int, data: ByteArray) {
+                listener?.onDataReceived(data)
+            }
+
+            override fun onStreamOpen(streamId: Int) {
+                connected.set(true)
+                listener?.onTunnelReady()
+            }
+
+            override fun onStreamClose(streamId: Int) {
+                listener?.onDisconnected("Stream $streamId closed")
+                connected.set(false)
+            }
+
+            override fun onStreamError(streamId: Int, error: String) {
+                listener?.onError("Stream $streamId: $error")
+            }
+        })
+
+        // Open a stream for the pending connection
+        multiplexer?.openStream(pendingTargetHost, pendingTargetPort)
+    }
+
+    private fun startLegacyMode() {
+        sendSocks5Greeting()
+    }
+
     private fun sendSocks5Greeting() {
         val greeting = byteArrayOf(0x05, 0x01, 0x00)
         webSocket?.send(greeting.toByteString(0, greeting.size))
@@ -164,6 +195,13 @@ class WebSocketTunnel(
     private fun handleServerData(data: ByteArray) {
         if (data.isEmpty()) return
 
+        // Multiplexed mode: all frames go to multiplexer
+        if (useMultiplexing) {
+            multiplexer?.handleFrame(data)
+            return
+        }
+
+        // Legacy mode: strip padding and handle SOCKS5
         val stripped = stripPadding(data)
 
         when {
@@ -220,6 +258,11 @@ class WebSocketTunnel(
 
     fun send(data: ByteArray): Boolean {
         if (!connected.get()) return false
+
+        if (useMultiplexing) {
+            return multiplexer?.sendData(legacyStreamId, data) ?: false
+        }
+
         val ws = webSocket ?: return false
         return try {
             ws.send(data.toByteString(0, data.size))
@@ -232,11 +275,19 @@ class WebSocketTunnel(
 
     fun disconnect() {
         connected.set(false)
+        if (useMultiplexing) {
+            multiplexer?.closeAll()
+            multiplexer = null
+        }
         webSocket?.close(1000, "Disconnect")
         webSocket = null
     }
 
     fun isConnected(): Boolean = connected.get()
+
+    fun cleanupStaleStreams(maxIdleMs: Long = 120_000) {
+        multiplexer?.cleanupStaleStreams(maxIdleMs)
+    }
 
     private fun generateWebSocketKey(): String {
         val key = ByteArray(16)
@@ -261,6 +312,44 @@ class WebSocketTunnel(
             "${basePath}${suffixes[random.nextInt(suffixes.size)]}"
         } else {
             basePath
+        }
+    }
+
+    private fun addVariedHeaders(builder: Request.Builder) {
+        // Rotate User-Agent between Chrome versions
+        val chromeVersions = listOf(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36"
+        )
+        val chromeVersion = chromeVersions[random.nextInt(chromeVersions.size)]
+        val majorVersion = chromeVersion.substringAfter("Chrome/").substringBefore(".")
+
+        val secChUa = "\"Google Chrome\";v=\"$majorVersion\", \"Chromium\";v=\"$majorVersion\", \"Not_A Brand\";v=\"${random.nextInt(10, 30)}\""
+
+        builder
+            .header("User-Agent", chromeVersion)
+            .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7")
+            .header("Accept-Language", "en-US,en;q=0.9")
+            .header("Accept-Encoding", "gzip, deflate, br, zstd")
+            .header("Sec-Ch-Ua", secChUa)
+            .header("Sec-Ch-Ua-Mobile", "?0")
+            .header("Sec-Ch-Ua-Platform", "\"Windows\"")
+            .header("Sec-Fetch-Dest", "websocket")
+            .header("Sec-Fetch-Mode", "navigate")
+            .header("Sec-Fetch-Site", "same-origin")
+            .header("Sec-Fetch-User", "?1")
+            .header("Upgrade", "websocket")
+            .header("Sec-WebSocket-Version", "13")
+            .header("Sec-WebSocket-Key", generateWebSocketKey())
+            .header("Cache-Control", "max-age=0")
+
+        // Occasionally add extra headers that real browsers send
+        if (random.nextBoolean()) {
+            builder.header("Priority", "u=1, i")
+        }
+        if (random.nextInt(3) == 0) {
+            builder.header("Sec-CH-UA-Full-Version-List", secChUa)
         }
     }
 }

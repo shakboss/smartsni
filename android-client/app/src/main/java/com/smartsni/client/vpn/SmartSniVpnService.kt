@@ -51,6 +51,7 @@ class SmartSniVpnService : VpnService(), NetworkDetector.Listener {
     private var domainManager: DomainManager? = null
 
     private val tcpConnections = ConcurrentHashMap<String, TcpSession>()
+    private val udpSessions = ConcurrentHashMap<String, UdpSession>()
 
     private enum class TcpState {
         SYN_RECEIVED, ESTABLISHED, FIN_WAIT, CLOSED
@@ -65,7 +66,17 @@ class SmartSniVpnService : VpnService(), NetworkDetector.Listener {
         var remoteSeq: Long,
         var state: TcpState,
         val wsTunnel: WebSocketTunnel,
-        var dataWriter: FileOutputStream? = null
+        var dataWriter: FileOutputStream? = null,
+        var lastActivity: Long = System.currentTimeMillis()
+    )
+
+    private data class UdpSession(
+        val srcIp: ByteArray,
+        val srcPort: Int,
+        val dstIp: String,
+        val dstPort: Int,
+        val wsTunnel: WebSocketTunnel,
+        var lastActivity: Long = System.currentTimeMillis()
     )
 
     private fun connKey(srcIp: String, srcPort: Int, dstIp: String, dstPort: Int) =
@@ -96,7 +107,7 @@ class SmartSniVpnService : VpnService(), NetworkDetector.Listener {
         }
 
         val delayMin = intent?.getIntExtra("delay_min", 5) ?: 5
-        val delayMax = intent?.getIntExtra("delay_max", 20) ?: 20
+        val delayMax = intent?.getIntExtra("delay_max", 200) ?: 200
 
         trafficShaper = TrafficShaper(
             delayMsRange = delayMin..delayMax,
@@ -184,7 +195,8 @@ class SmartSniVpnService : VpnService(), NetworkDetector.Listener {
         configureShapingForNetwork(isMobile)
 
         tunnelJob = scope.launch {
-            runTunnel()
+            launch { runTunnel() }
+            launch { sessionCleanupLoop() }
         }
     }
 
@@ -202,17 +214,11 @@ class SmartSniVpnService : VpnService(), NetworkDetector.Listener {
     }
 
     private fun configureShapingForNetwork(isMobile: Boolean) {
-        if (isMobile) {
-            trafficShaper?.apply {
-                setEnabled(true)
-            }
-            Log.i(TAG, "Mobile network: aggressive DPI bypass enabled")
-        } else {
-            trafficShaper?.apply {
-                setEnabled(true)
-            }
-            Log.i(TAG, "Non-mobile network: standard shaping enabled")
+        trafficShaper?.apply {
+            setEnabled(true)
         }
+        val mode = if (isMobile) "aggressive" else "standard"
+        Log.i(TAG, "Network: $mode shaping enabled")
     }
 
     private fun buildNotification(subtext: String): Notification {
@@ -285,35 +291,137 @@ class SmartSniVpnService : VpnService(), NetworkDetector.Listener {
     ) {
         val udpHeader = UdpHeader.parse(packet, ipHeader.payloadOffset) ?: return
         val dnsOffset = ipHeader.payloadOffset + 8
+        val payloadEnd = ipHeader.payloadOffset + udpHeader.length
+        val payload = packet.copyOfRange(dnsOffset, payloadEnd)
 
         if (udpHeader.dstPort == 53) {
-            val dnsQuery = packet.copyOfRange(dnsOffset, ipHeader.payloadOffset + udpHeader.length)
-            try {
-                val dnsResponse = dnsResolver?.resolve(dnsQuery) ?: return
-                val udpPayloadLen = dnsResponse.size
+            // DNS: resolve via DoH
+            handleDns(ipHeader, udpHeader, payload, outputStream)
+        } else {
+            // Non-DNS UDP: tunnel through WebSocket
+            handleUdpTunnel(ipHeader, udpHeader, payload, outputStream)
+        }
+    }
+
+    private suspend fun handleDns(
+        ipHeader: IpHeader,
+        udpHeader: UdpHeader,
+        dnsQuery: ByteArray,
+        outputStream: FileOutputStream
+    ) {
+        try {
+            val dnsResponse = dnsResolver?.resolve(dnsQuery) ?: return
+            val udpPayloadLen = dnsResponse.size
+            val ipPkt = PacketBuilder.buildIpHeader(
+                ipHeader.dstIp, ipHeader.srcIp,
+                IpHeader.UDP, 8 + udpPayloadLen
+            )
+            val udpHdr = ByteArray(8)
+            udpHdr[0] = (udpHeader.dstPort shr 8).toByte()
+            udpHdr[1] = (udpHeader.dstPort and 0xFF).toByte()
+            udpHdr[2] = (udpHeader.srcPort shr 8).toByte()
+            udpHdr[3] = (udpHeader.srcPort and 0xFF).toByte()
+            udpHdr[4] = ((8 + udpPayloadLen) shr 8).toByte()
+            udpHdr[5] = ((8 + udpPayloadLen) and 0xFF).toByte()
+
+            val response = ByteArray(ipPkt.size + 8 + udpPayloadLen)
+            System.arraycopy(ipPkt, 0, response, 0, ipPkt.size)
+            System.arraycopy(udpHdr, 0, response, ipPkt.size, 8)
+            System.arraycopy(dnsResponse, 0, response, ipPkt.size + 8, udpPayloadLen)
+            outputStream.write(response)
+            outputStream.flush()
+            Log.d(TAG, "DNS response sent: ${dnsResponse.size} bytes")
+        } catch (e: Exception) {
+            Log.e(TAG, "DNS DoH failed: ${e.message}")
+        }
+    }
+
+    private fun handleUdpTunnel(
+        ipHeader: IpHeader,
+        udpHeader: UdpHeader,
+        payload: ByteArray,
+        outputStream: FileOutputStream
+    ) {
+        val key = connKey(ipHeader.srcIpString, udpHeader.srcPort, ipHeader.dstIpString, udpHeader.dstPort)
+        val dstIp = ipHeader.dstIpString
+        val dstPort = udpHeader.dstPort
+
+        val session = udpSessions[key]
+        if (session != null) {
+            // Send data through existing tunnel
+            session.lastActivity = System.currentTimeMillis()
+            session.wsTunnel.send(payload)
+            return
+        }
+
+        // Create new UDP tunnel session
+        val shaperForConn = TrafficShaper(
+            delayMsRange = 5..200,
+            jitterEnabled = trafficShaper?.isEnabled() == true
+        )
+
+        val frontingConfig = domainManager?.getFrontingConfig()
+        val fallbackHosts = domainManager?.getFallbackDomains() ?: emptyList()
+
+        val wsTunnel = WebSocketTunnel(
+            serverHost, wsPath, bypassTriggerSni, bypassSecret,
+            shaperForConn, frontingConfig, fallbackHosts
+        )
+
+        val udpSession = UdpSession(
+            srcIp = ipHeader.srcIp.copyOf(),
+            srcPort = udpHeader.srcPort,
+            dstIp = dstIp,
+            dstPort = dstPort,
+            wsTunnel = wsTunnel
+        )
+
+        wsTunnel.setListener(object : WebSocketTunnel.Listener {
+            override fun onTunnelReady() {
+                Log.d(TAG, "UDP tunnel ready for $key")
+                wsTunnel.send(payload)
+            }
+
+            override fun onDataReceived(data: ByteArray) {
+                val udpPayloadLen = data.size
                 val ipPkt = PacketBuilder.buildIpHeader(
-                    ipHeader.dstIp, ipHeader.srcIp,
+                    udpSession.srcIp, ipHeader.srcIp,
                     IpHeader.UDP, 8 + udpPayloadLen
                 )
                 val udpHdr = ByteArray(8)
-                udpHdr[0] = (udpHeader.dstPort shr 8).toByte()
-                udpHdr[1] = (udpHeader.dstPort and 0xFF).toByte()
-                udpHdr[2] = (udpHeader.srcPort shr 8).toByte()
-                udpHdr[3] = (udpHeader.srcPort and 0xFF).toByte()
+                udpHdr[0] = (dstPort shr 8).toByte()
+                udpHdr[1] = (dstPort and 0xFF).toByte()
+                udpHdr[2] = (udpSession.srcPort shr 8).toByte()
+                udpHdr[3] = (udpSession.srcPort and 0xFF).toByte()
                 udpHdr[4] = ((8 + udpPayloadLen) shr 8).toByte()
                 udpHdr[5] = ((8 + udpPayloadLen) and 0xFF).toByte()
 
                 val response = ByteArray(ipPkt.size + 8 + udpPayloadLen)
                 System.arraycopy(ipPkt, 0, response, 0, ipPkt.size)
                 System.arraycopy(udpHdr, 0, response, ipPkt.size, 8)
-                System.arraycopy(dnsResponse, 0, response, ipPkt.size + 8, udpPayloadLen)
-                outputStream.write(response)
-                outputStream.flush()
-                Log.d(TAG, "DNS response sent: ${dnsResponse.size} bytes")
-            } catch (e: Exception) {
-                Log.e(TAG, "DNS DoH failed: ${e.message}")
+                System.arraycopy(data, 0, response, ipPkt.size + 8, udpPayloadLen)
+
+                try {
+                    outputStream.write(response)
+                    outputStream.flush()
+                } catch (e: Exception) {
+                    Log.e(TAG, "UDP tunnel write failed: ${e.message}")
+                }
             }
-        }
+
+            override fun onDisconnected(reason: String) {
+                Log.d(TAG, "UDP tunnel disconnected: $key - $reason")
+                udpSessions.remove(key)
+            }
+
+            override fun onError(error: String) {
+                Log.e(TAG, "UDP tunnel error: $key - $error")
+                udpSessions.remove(key)
+            }
+        })
+
+        udpSessions[key] = udpSession
+        wsTunnel.connect(dstIp, dstPort)
     }
 
     private fun handleTcp(
@@ -365,12 +473,23 @@ class SmartSniVpnService : VpnService(), NetworkDetector.Listener {
 
         if (payload.isNotEmpty() && session.state == TcpState.ESTABLISHED) {
             session.remoteSeq = tcpHeader.seq + payload.size
+            session.lastActivity = System.currentTimeMillis()
+
+            // Send ACK for the received data
             sendTcpSegment(outputStream, session, ipHeader.dstIp, ipHeader.srcIp,
                 tcpHeader.dstPort, tcpHeader.srcPort, TcpHeader.ACK)
 
+            // Send data through tunnel
             if (!session.wsTunnel.send(payload)) {
                 Log.e(TAG, "WS send failed for $key")
                 cleanupSession(key, session)
+            }
+
+            // TCP window management: send window update if buffer is getting full
+            val windowSize = 65535
+            if (tcpHeader.window < windowSize / 2) {
+                // Peer is running low on buffer, we could adjust
+                // For now, just continue (the tunnel handles flow control)
             }
         }
     }
@@ -396,7 +515,7 @@ class SmartSniVpnService : VpnService(), NetworkDetector.Listener {
         val remoteSeq = tcpHeader.seq + 1
 
         val shaperForConn = TrafficShaper(
-            delayMsRange = trafficShaper?.let { 5..20 } ?: 0..0,
+            delayMsRange = trafficShaper?.let { 5..200 } ?: 0..0,
             jitterEnabled = trafficShaper?.isEnabled() == true
         )
 
@@ -429,6 +548,7 @@ class SmartSniVpnService : VpnService(), NetworkDetector.Listener {
 
             override fun onDataReceived(data: ByteArray) {
                 val writer = session.dataWriter ?: return
+                session.lastActivity = System.currentTimeMillis()
                 sendTcpSegment(writer, session, ipHeader.dstIp, session.srcIp,
                     session.dstPort, session.srcPort, TcpHeader.ACK or TcpHeader.PSH, data)
                 session.localSeq += data.size
@@ -502,6 +622,45 @@ class SmartSniVpnService : VpnService(), NetworkDetector.Listener {
         tcpConnections.remove(key)
     }
 
+    /**
+     * Periodically evict stale TCP and UDP sessions to prevent memory leaks.
+     * Runs every 30 seconds and removes sessions idle for > 120 seconds.
+     */
+    private suspend fun sessionCleanupLoop() {
+        while (isActive && isRunning) {
+            delay(30_000)
+            val now = System.currentTimeMillis()
+            val staleTimeout = 120_000L
+
+            // Evict stale TCP sessions
+            val staleTcpKeys = tcpConnections.entries
+                .filter { now - it.value.lastActivity > staleTimeout }
+                .map { it.key }
+            for (key in staleTcpKeys) {
+                val session = tcpConnections.remove(key)
+                if (session != null) {
+                    Log.d(TAG, "Evicting stale TCP session: $key")
+                    session.wsTunnel.disconnect()
+                }
+            }
+
+            // Evict stale UDP sessions
+            val staleUdpKeys = udpSessions.entries
+                .filter { now - it.value.lastActivity > staleTimeout }
+                .map { it.key }
+            for (key in staleUdpKeys) {
+                val session = udpSessions.remove(key)
+                if (session != null) {
+                    Log.d(TAG, "Evicting stale UDP session: $key")
+                    session.wsTunnel.disconnect()
+                }
+            }
+
+            // Cleanup stale streams in multiplexed tunnels
+            tcpConnections.values.forEach { it.wsTunnel.cleanupStaleStreams() }
+        }
+    }
+
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val channel = NotificationChannel(
@@ -528,6 +687,11 @@ class SmartSniVpnService : VpnService(), NetworkDetector.Listener {
             session.wsTunnel.disconnect()
         }
         tcpConnections.clear()
+
+        udpSessions.values.forEach { session ->
+            session.wsTunnel.disconnect()
+        }
+        udpSessions.clear()
 
         dnsResolver?.close()
         vpnInterface?.close()
