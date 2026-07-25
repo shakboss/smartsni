@@ -31,6 +31,9 @@ geoip_reader: Optional[geoip2.database.Reader] = None
 # Upstream DoH client
 doh_client = httpx.AsyncClient(timeout=10.0)
 
+# SNI capture during TLS handshake
+_sni_map: Dict[int, str] = {}
+
 
 # --- Configuration ---
 class BypassSettings:
@@ -408,38 +411,32 @@ async def handle_socks5_handshake(reader: asyncio.StreamReader, writer: asyncio.
     except (asyncio.IncompleteReadError, ConnectionResetError, UnicodeDecodeError):
         return None
 
+def _sni_callback(ssl_sock, server_name, ssl_context):
+    """Called during TLS handshake to capture the SNI."""
+    try:
+        _sni_map[ssl_sock.fileno()] = server_name
+    except Exception:
+        pass
+
+
 async def handle_connection(client_reader: asyncio.StreamReader, client_writer: asyncio.StreamWriter):
-    """Main entry point for incoming connections on port 443."""
-    full_client_hello = b''
+    """Main entry point for incoming TLS connections on port 443.
+
+    TLS is already terminated by the SSL context. client_reader/writer
+    carry decrypted plaintext. SNI was captured during the handshake.
+    """
     server_name = None
     try:
-        # 1. Read the 5-byte TLS record header to get the length of the ClientHello.
-        header = await asyncio.wait_for(client_reader.readexactly(5), timeout=5.0)
-        if header[0] != 0x16:  # 0x16 = Handshake
-            logging.warning("Incoming connection is not a TLS handshake. Closing.")
-            return
-
-        record_len = int.from_bytes(header[3:5], 'big')
-
-        # 2. Read the rest of the record in chunks to be more robust.
-        record_body = b''
-        bytes_to_read = record_len
-        while bytes_to_read > 0:
-            chunk = await asyncio.wait_for(client_reader.read(bytes_to_read), timeout=5.0)
-            if not chunk: break # Connection closed prematurely
-            record_body += chunk
-            bytes_to_read -= len(chunk)
-
-        # 3. We now have the full ClientHello packet.
-        full_client_hello = header + record_body
-
-        server_name = parse_sni(full_client_hello)
+        transport = client_writer.transport
+        sock = transport.get_extra_info('socket')
+        if sock:
+            server_name = _sni_map.pop(sock.fileno(), None)
 
         if not server_name:
-            logging.warning("SNI not found or could not be parsed. Closing connection.")
-            client_writer.write(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 20\r\n\r\nSNI extension missing")
-            await client_writer.drain()
+            logging.warning("SNI not found after TLS handshake. Closing connection.")
             return
+
+        logging.info(f"SNI proxy: connection for {server_name}")
 
         # --- Routing Logic ---
         proxy_mode = "direct"
@@ -474,7 +471,7 @@ async def handle_connection(client_reader: asyncio.StreamReader, client_writer: 
                                 use_bypass = True
                                 break
                     except geoip2.errors.AddressNotFoundError:
-                        pass  # IP not in database
+                        pass
                     except Exception as e:
                         logging.warning(f"GeoIP lookup failed for {ip_str}: {e}")
 
@@ -485,8 +482,6 @@ async def handle_connection(client_reader: asyncio.StreamReader, client_writer: 
                 target_port = 8080  # Internal FastAPI/Uvicorn server
                 logging.info(f"Bypass: WebSocket mode activated for SNI: {server_name}")
             else:  # 'shape' mode for TLS-in-TLS
-                # The 'shape' mode with a trigger_sni implies a SOCKS5 handshake will be sent by the client
-                # inside the TLS tunnel to specify the real destination.
                 try:
                     socks_target = await handle_socks5_handshake(client_reader, client_writer)
                     if not socks_target:
@@ -501,7 +496,7 @@ async def handle_connection(client_reader: asyncio.StreamReader, client_writer: 
                     proxy_mode = "shape"
                     logging.info(f"Bypass: Shape/SOCKS mode activated for SNI: {server_name} -> {target_host}:{target_port}")
                 except (asyncio.IncompleteReadError, ConnectionResetError):
-                    return # Client disconnected during SOCKS handshake
+                    return
 
         else:  # direct proxy
             if server_name.lower() == current_host.lower():
@@ -512,21 +507,31 @@ async def handle_connection(client_reader: asyncio.StreamReader, client_writer: 
                 target_port = 443
 
         if proxy_mode == "shape" and not use_bypass:
-            # This is the mobile-detect case for 'shape' mode. The target is the SNI itself.
             target_host = server_name
             target_port = 443
             logging.info(f"Bypass: Shape mode activated for mobile network -> {target_host}:{target_port}")
 
-        backend_reader, backend_writer = await asyncio.open_connection(target_host, target_port)
-        backend_writer.write(full_client_hello)
-        await backend_writer.drain()
+        if proxy_mode == "direct":
+            # For direct proxy, open a new TLS connection to the target
+            # and relay decrypted client data over it (TLS-in-TLS)
+            try:
+                target_ssl = ssl.create_default_context()
+                backend_reader, backend_writer = await asyncio.open_connection(
+                    target_host, target_port, ssl=target_ssl
+                )
+                logging.info(f"SNI proxy: direct TLS relay to {target_host}:{target_port}")
+            except Exception as e:
+                logging.warning(f"Could not connect to {target_host}:{target_port}: {e}")
+                return
+        else:
+            # For websocket_forward and shape, connect to backend over plain TCP
+            backend_reader, backend_writer = await asyncio.open_connection(target_host, target_port)
+            logging.info(f"SNI proxy: relay to {target_host}:{target_port}")
 
         if proxy_mode == "shape":
-            # Relay with obfuscation
             task1 = asyncio.create_task(shape_and_relay(client_reader, backend_writer, bypass))
             task2 = asyncio.create_task(shape_and_relay(backend_reader, client_writer, bypass))
         else:  # direct and websocket_forward
-            # Simple relay without obfuscation
             task1 = asyncio.create_task(relay_streams(client_reader, backend_writer))
             task2 = asyncio.create_task(relay_streams(backend_reader, client_writer))
 
@@ -542,8 +547,35 @@ async def handle_connection(client_reader: asyncio.StreamReader, client_writer: 
 
 
 async def start_sni_proxy():
-    server = await asyncio.start_server(handle_connection, '0.0.0.0', 443)
-    logging.info("SNI proxy listening on 0.0.0.0:443")
+    import pathlib
+
+    ssl_context = None
+    cert_dir = pathlib.Path("/etc/letsencrypt/live")
+
+    # Find a valid cert directory (try main host first, then trigger domains)
+    async with config_lock:
+        domains_to_try = [config.get("host", "")] + config.get("trigger_domains", [])
+
+    for domain in domains_to_try:
+        if not domain:
+            continue
+        cert_path = cert_dir / domain / "fullchain.pem"
+        key_path = cert_dir / domain / "privkey.pem"
+        if cert_path.exists() and key_path.exists():
+            ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ssl_context.load_cert_chain(str(cert_path), str(key_path))
+            ssl_context.set_servername_callback(_sni_callback)
+            logging.info(f"SNI proxy: using TLS certs from {cert_path}")
+            break
+
+    if ssl_context:
+        server = await asyncio.start_server(handle_connection, '0.0.0.0', 443, ssl=ssl_context)
+        logging.info("SNI proxy listening on 0.0.0.0:443 (TLS terminated)")
+    else:
+        logging.warning("No TLS certs found. SNI proxy cannot start on port 443.")
+        logging.warning("Run: certbot certonly --standalone -d your_domain")
+        return
+
     async with server:
         await server.serve_forever()
 
