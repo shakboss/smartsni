@@ -122,13 +122,17 @@ detect_distro() {
 install_dependencies() {
     step "Installing system packages"
 
-    $PM update -y >>"$LOG_FILE" 2>&1
+    export DEBIAN_FRONTEND=noninteractive
 
-    local packages=("python3" "python3-pip" "python3-venv" "git" "jq" "curl" "wget" "certbot" "libcap2-bin" "ufw" "fail2ban" "net-tools")
+    DEBIAN_FRONTEND=noninteractive $PM update -y >>"$LOG_FILE" 2>&1
+
+    export DEBIAN_FRONTEND=noninteractive
+
+    local packages=("python3" "python3-pip" "python3-venv" "git" "jq" "curl" "wget" "certbot" "libcap2-bin" "net-tools")
 
     # CentOS/RHEL adjustments
     if [[ "$PM" == "yum" ]] || [[ "$PM" == "dnf" ]]; then
-        packages=("python3" "python3-pip" "git" "jq" "curl" "wget" "certbot" "libcap" "firewalld" "fail2ban" "net-tools")
+        packages=("python3" "python3-pip" "git" "jq" "curl" "wget" "certbot" "libcap" "net-tools")
     fi
 
     local total=${#packages[@]}
@@ -136,10 +140,10 @@ install_dependencies() {
     for pkg in "${packages[@]}"; do
         ((count++))
         progress $count $total "Installing $pkg"
-        if $PM install -y "$pkg" >>"$LOG_FILE" 2>&1; then
+        if DEBIAN_FRONTEND=noninteractive $PM install -y --no-install-recommends -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" "$pkg" >>"$LOG_FILE" 2>&1; then
             :
         else
-            warn "Could not install $pkg (may not be available on this distro)"
+            warn "Could not install $pkg (may not be available)"
         fi
     done
 
