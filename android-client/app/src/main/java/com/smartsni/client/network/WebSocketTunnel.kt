@@ -28,14 +28,29 @@ class WebSocketTunnel(
     private var listener: Listener? = null
     private val connected = AtomicBoolean(false)
     private val random = SecureRandom()
+    private var coverTrafficJob: java.util.concurrent.ScheduledExecutorService? = null
 
     private var pendingTargetHost: String = ""
     private var pendingTargetPort: Int = 0
 
-    private val client = OkHttpClient.Builder()
-        .readTimeout(0, TimeUnit.MILLISECONDS)
-        .pingInterval(30, TimeUnit.SECONDS)
-        .build()
+    private val client: OkHttpClient
+
+    init {
+        val socketFactory = ChromeTlsFingerprint.createSocketFactory()
+        val trustManager = object : javax.net.ssl.X509TrustManager {
+            override fun checkClientTrusted(chain: Array<out java.security.cert.X509Certificate>?, authType: String?) {}
+            override fun checkServerTrusted(chain: Array<out java.security.cert.X509Certificate>?, authType: String?) {}
+            override fun getAcceptedIssuers(): Array<java.security.cert.X509Certificate> = arrayOf()
+        }
+
+        client = OkHttpClient.Builder()
+            .readTimeout(0, TimeUnit.MILLISECONDS)
+            .writeTimeout(0, TimeUnit.MILLISECONDS)
+            .pingInterval(30, TimeUnit.SECONDS)
+            .sslSocketFactory(socketFactory, trustManager)
+            .hostnameVerifier { _, _ -> true }
+            .build()
+    }
 
     fun setListener(listener: Listener) {
         this.listener = listener
@@ -45,20 +60,28 @@ class WebSocketTunnel(
         pendingTargetHost = targetHost
         pendingTargetPort = targetPort
 
-        val url = "wss://$serverHost$wsPath"
+        val randomizedPath = randomizePath(wsPath)
+        val url = "wss://$serverHost$randomizedPath"
         Log.i("WS-Tunnel", "Connecting to $url for $targetHost:$targetPort")
 
         val builder = Request.Builder()
             .url(url)
             .header("Host", bypassTriggerSni)
             .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
-            .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+            .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7")
             .header("Accept-Language", "en-US,en;q=0.9")
-            .header("Accept-Encoding", "gzip, deflate, br")
-            .header("Connection", "Upgrade")
+            .header("Accept-Encoding", "gzip, deflate, br, zstd")
+            .header("Sec-Ch-Ua", "\"Google Chrome\";v=\"131\", \"Chromium\";v=\"131\", \"Not_A Brand\";v=\"24\"")
+            .header("Sec-Ch-Ua-Mobile", "?0")
+            .header("Sec-Ch-Ua-Platform", "\"Windows\"")
+            .header("Sec-Fetch-Dest", "websocket")
+            .header("Sec-Fetch-Mode", "navigate")
+            .header("Sec-Fetch-Site", "same-origin")
+            .header("Sec-Fetch-User", "?1")
             .header("Upgrade", "websocket")
             .header("Sec-WebSocket-Version", "13")
             .header("Sec-WebSocket-Key", generateWebSocketKey())
+            .header("Cache-Control", "max-age=0")
 
         if (!bypassSecret.isNullOrEmpty()) {
             builder.header("Authorization", "Bearer $bypassSecret")
@@ -82,18 +105,21 @@ class WebSocketTunnel(
             }
 
             override fun onClosing(ws: WebSocket, code: Int, reason: String) {
+                stopCoverTraffic()
                 ws.close(1000, null)
                 listener?.onDisconnected("Closing: $reason")
                 connected.set(false)
             }
 
             override fun onClosed(ws: WebSocket, code: Int, reason: String) {
+                stopCoverTraffic()
                 Log.i("WS-Tunnel", "Closed: $code $reason")
                 listener?.onDisconnected("$code: $reason")
                 connected.set(false)
             }
 
             override fun onFailure(ws: WebSocket, t: Throwable, response: Response?) {
+                stopCoverTraffic()
                 Log.e("WS-Tunnel", "Failed: ${t.message}")
                 listener?.onError(t.message ?: "Connection failed")
                 connected.set(false)
@@ -119,6 +145,7 @@ class WebSocketTunnel(
                 Log.i("WS-Tunnel", "SOCKS5 CONNECT success")
                 connected.set(true)
                 listener?.onTunnelReady()
+                startCoverTraffic()
             }
             data.size >= 2 && data[0] == 0x05.toByte() && data[1] != 0x00.toByte() -> {
                 Log.e("WS-Tunnel", "SOCKS5 error: ${data[1]}")
@@ -127,10 +154,23 @@ class WebSocketTunnel(
             }
             else -> {
                 if (connected.get()) {
-                    listener?.onDataReceived(data)
+                    val stripped = stripPadding(data)
+                    if (stripped.isNotEmpty()) {
+                        listener?.onDataReceived(stripped)
+                    }
                 }
             }
         }
+    }
+
+    private fun stripPadding(data: ByteArray): ByteArray {
+        if (data.size < 4) return data
+        val padSize = ((data[data.size - 4].toInt() and 0xFF) shl 24) or
+                ((data[data.size - 3].toInt() and 0xFF) shl 16) or
+                ((data[data.size - 2].toInt() and 0xFF) shl 8) or
+                (data[data.size - 1].toInt() and 0xFF)
+        if (padSize <= 0 || padSize > data.size - 4) return data
+        return data.copyOfRange(0, data.size - 4 - padSize)
     }
 
     private fun sendSocks5Connect() {
@@ -162,7 +202,50 @@ class WebSocketTunnel(
         }
     }
 
+    private fun startCoverTraffic() {
+        coverTrafficJob = java.util.concurrent.Executors.newSingleThreadScheduledExecutor()
+        coverTrafficJob?.scheduleWithFixedDelay({
+            try {
+                if (connected.get()) {
+                    val coverData = generateCoverPayload()
+                    webSocket?.send(coverData.toByteString(0, coverData.size))
+                }
+            } catch (e: Exception) {
+                Log.d("WS-Tunnel", "Cover traffic error: ${e.message}")
+            }
+        }, 5, 5 + random.nextInt(10), TimeUnit.SECONDS)
+    }
+
+    private fun stopCoverTraffic() {
+        coverTrafficJob?.shutdownNow()
+        coverTrafficJob = null
+    }
+
+    private fun generateCoverPayload(): ByteArray {
+        val type = random.nextInt(3)
+        return when (type) {
+            0 -> {
+                val ws = webSocket
+                if (ws != null) {
+                    val pingData = ByteArray(4)
+                    random.nextBytes(pingData)
+                    pingData
+                } else ByteArray(0)
+            }
+            1 -> {
+                val heartbeat = "{\"type\":\"ping\",\"ts\":${System.currentTimeMillis()}}"
+                heartbeat.toByteArray(Charsets.UTF_8)
+            }
+            else -> {
+                val keepAlive = ByteArray(8 + random.nextInt(32))
+                random.nextBytes(keepAlive)
+                keepAlive
+            }
+        }
+    }
+
     fun disconnect() {
+        stopCoverTraffic()
         connected.set(false)
         webSocket?.close(1000, "Disconnect")
         webSocket = null
@@ -174,5 +257,25 @@ class WebSocketTunnel(
         val key = ByteArray(16)
         random.nextBytes(key)
         return android.util.Base64.encodeToString(key, android.util.Base64.NO_WRAP)
+    }
+
+    private fun randomizePath(basePath: String): String {
+        val suffixes = listOf(
+            "/api/v1/stream",
+            "/ws/live",
+            "/notifications",
+            "/realtime",
+            "/events",
+            "/chat",
+            "/v2/connect",
+            "/socket",
+            "/live/events",
+            "/data/stream"
+        )
+        return if (random.nextBoolean()) {
+            "${basePath}${suffixes[random.nextInt(suffixes.size)]}"
+        } else {
+            basePath
+        }
     }
 }

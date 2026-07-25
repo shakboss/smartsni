@@ -285,17 +285,25 @@ async def shape_and_relay(reader: asyncio.StreamReader, writer: asyncio.StreamWr
 
 
 async def obfuscate_and_relay_ws(source_reader: asyncio.StreamReader, dest_ws: WebSocket, settings: BypassSettings):
-    """Reads from a stream and sends over a WebSocket (clean, no padding).
+    """Reads from a stream and sends over a WebSocket with padding.
 
-    Padding is NOT applied here because the Android client expects clean data
-    to write back to the TUN interface. Padding is only useful for raw TCP
-    tunnels (shape mode) where the client can strip it.
+    Padding format: [data] + [4-byte big-endian pad_length] + [random_padding]
+    The Android client strips padding using the 4-byte length suffix.
+    This prevents traffic analysis based on packet sizes.
     """
     try:
         while not source_reader.at_eof():
             data = await source_reader.read(2048)
             if not data:
                 break
+
+            if settings.padding_size_range and settings.padding_size_range[1] > 0:
+                min_pad, max_pad = settings.padding_size_range
+                pad_size = random.randint(min_pad, max_pad)
+                padding = os.urandom(pad_size)
+                pad_len_bytes = pad_size.to_bytes(4, 'big')
+                data += pad_len_bytes + padding
+
             await dest_ws.send_bytes(data)
     except (WebSocketDisconnect, ConnectionResetError):
         pass
@@ -486,8 +494,60 @@ async def start_sni_proxy():
         await server.serve_forever()
 
 
-# --- FastAPI App (DoH and WebSocket) ---
+# --- FastAPI App (DoH, Website, and WebSocket) ---
 app = FastAPI()
+
+COVER_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SecureMail - Encrypted Communications</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0f172a; color: #e2e8f0; min-height: 100vh; }
+        .container { max-width: 800px; margin: 0 auto; padding: 40px 20px; }
+        header { text-align: center; padding: 60px 0 40px; }
+        h1 { font-size: 2.5rem; color: #38bdf8; margin-bottom: 12px; }
+        .subtitle { color: #94a3b8; font-size: 1.1rem; }
+        .features { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 24px; margin-top: 40px; }
+        .feature { background: #1e293b; border-radius: 12px; padding: 24px; border: 1px solid #334155; }
+        .feature h3 { color: #38bdf8; margin-bottom: 8px; }
+        .feature p { color: #94a3b8; font-size: 0.9rem; line-height: 1.5; }
+        footer { text-align: center; padding: 40px 0; color: #475569; font-size: 0.85rem; }
+        a { color: #38bdf8; text-decoration: none; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>SecureMail</h1>
+            <p class="subtitle">Enterprise-grade encrypted communications platform</p>
+        </header>
+        <div class="features">
+            <div class="feature">
+                <h3>End-to-End Encryption</h3>
+                <p>All messages are encrypted with AES-256-GCM. Only you and your recipient can read them.</p>
+            </div>
+            <div class="feature">
+                <h3>Zero-Knowledge Architecture</h3>
+                <p>We never have access to your encryption keys or message content.</p>
+            </div>
+            <div class="feature">
+                <h3>Secure File Sharing</h3>
+                <p>Share files up to 2GB with automatic encryption and expiration policies.</p>
+            </div>
+            <div class="feature">
+                <h3>Team Workspaces</h3>
+                <p>Create encrypted channels for your team with role-based access control.</p>
+            </div>
+        </div>
+        <footer>
+            <p>&copy; 2024 SecureMail. All rights reserved. | <a href="/privacy">Privacy</a> | <a href="/terms">Terms</a></p>
+        </footer>
+    </div>
+</body>
+</html>"""
 
 
 @app.get("/dns-query")
@@ -508,13 +568,23 @@ async def doh_handler(request: Request):
     return Response(content=response_bytes, media_type="application/dns-message")
 
 
+@app.get("/{full_path:path}")
+async def website_handler(request: Request, full_path: str):
+    return Response(content=COVER_HTML, media_type="text/html")
+
+
 @app.websocket("/{full_path:path}")
 async def websocket_handler(websocket: WebSocket, full_path: str):
     async with config_lock:
         bypass_settings_data = config.get("bypass_settings")
         bypass = BypassSettings(bypass_settings_data) if bypass_settings_data else None
 
-    if not (bypass and bypass.enabled and bypass.mode == "websocket" and f"/{full_path}" == bypass.tunnel_path):
+    if not (bypass and bypass.enabled and bypass.mode == "websocket"):
+        await websocket.close(code=4004)
+        return
+
+    path_matches = f"/{full_path}".startswith(bypass.tunnel_path)
+    if not path_matches:
         await websocket.close(code=4004)
         return
 
