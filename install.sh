@@ -1042,9 +1042,26 @@ main() {
                 echo "    --skip-security        Skip security hardening"
                 echo "    --skip-firewall        Skip firewall setup"
                 ;;
-            *)
-                error "Unknown flag: $1 (use --help for usage)"
-                exit 1
+            --domain|--email|--trigger|--fallbacks|--mode|--secret|--carriers)
+                # Auto-install flags - pass everything to do_install
+                check_root
+                do_install "$@"
+                ;;
+            --fronting|--cloudflare|--mobile-detect|--skip-security|--skip-firewall)
+                # Boolean flags - pass everything to do_install
+                check_root
+                do_install "$@"
+                ;;
+            --*)
+                # Any other --flag: check if it looks like an auto-install flag
+                # by scanning all arguments for --domain
+                if echo "$@" | grep -q -- '--domain'; then
+                    check_root
+                    do_install "$@"
+                else
+                    error "Unknown flag: $1 (use --help for usage)"
+                    exit 1
+                fi
                 ;;
         esac
         return
