@@ -6,6 +6,7 @@ import os
 import random
 import ssl
 import struct
+import time
 from typing import Any, Dict, Optional
 
 import dns.flags
@@ -21,7 +22,17 @@ import uvicorn
 from fastapi import FastAPI, Request, Response, WebSocket, WebSocketDisconnect
 
 # --- Globals ---
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+DEBUG = os.environ.get("DEBUG", "").lower() in ("1", "true", "yes")
+LOG_LEVEL = logging.DEBUG if DEBUG else logging.INFO
+logging.basicConfig(
+    level=LOG_LEVEL,
+    format='%(asctime)s - %(levelname)s - %(name)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S',
+)
+if DEBUG:
+    logging.getLogger("uvicorn.access").setLevel(logging.DEBUG)
+    logging.getLogger("uvicorn").setLevel(logging.DEBUG)
+    logging.debug("Debug mode enabled via DEBUG env var")
 
 # Configuration and state
 config: Dict[str, Any] = {}
@@ -75,11 +86,13 @@ async def load_config(filename: str) -> (Dict[str, Any], Optional[geoip2.databas
     try:
         with open(filename, 'r') as f:
             new_config_data = json.load(f)
+        logging.debug(f"Config loaded: {len(new_config_data)} keys: {list(new_config_data.keys())}")
 
         new_geoip_reader = None
         bypass_settings_data = new_config_data.get("bypass_settings")
         if bypass_settings_data:
             bypass = BypassSettings(bypass_settings_data)
+            logging.debug(f"Bypass settings: enabled={bypass.enabled}, mode={bypass.mode}, trigger_sni={bypass.trigger_sni}")
             if bypass.enabled and bypass.detect_mobile_networks and bypass.geoip_db_path:
                 try:
                     new_geoip_reader = geoip2.database.Reader(bypass.geoip_db_path)
@@ -102,6 +115,7 @@ async def reload_config_periodically():
         if reload_interval <= 0:
             reload_interval = 1
 
+        logging.debug(f"Config reload scheduled in {reload_interval} minutes")
         await asyncio.sleep(reload_interval * 60)
 
         logging.info("Checking for configuration updates...")
@@ -114,6 +128,8 @@ async def reload_config_periodically():
                 config = new_config_data
                 geoip_reader = new_geoip_reader
             logging.info("Configuration reloaded successfully.")
+        else:
+            logging.warning("Configuration reload failed, keeping current config.")
 
 
 async def rotate_domains():
@@ -127,8 +143,10 @@ async def rotate_domains():
             rotation_minutes = config.get("domain_rotation_minutes", 60)
 
         if len(domains) <= 1:
+            logging.debug("Domain rotation: only 1 or 0 domains configured, skipping")
             continue
 
+        logging.debug(f"Domain rotation scheduled in {rotation_minutes} minutes")
         await asyncio.sleep(rotation_minutes * 60)
 
         async with config_lock:
@@ -166,6 +184,7 @@ async def process_dns_query(query_bytes: bytes) -> bytes:
 
         question = msg.question[0]
         domain_name = question.name.to_text(omit_final_dot=True)
+        logging.debug(f"DNS query: {domain_name} (type={dns.rdatatype.to_text(question.rdtype)})")
 
         # Check local domains
         async with config_lock:
@@ -173,6 +192,7 @@ async def process_dns_query(query_bytes: bytes) -> bytes:
 
         ip_str = find_value_by_key_contains(domains_map, domain_name)
         if ip_str:
+            logging.debug(f"DNS local match: {domain_name} -> {ip_str}")
             answer = dns.rrset.from_text(question.name, 3600, dns.rdataclass.IN, dns.rdatatype.A, ip_str)
             msg.answer.append(answer)
             msg.flags |= dns.flags.AA | dns.flags.QR
@@ -181,8 +201,10 @@ async def process_dns_query(query_bytes: bytes) -> bytes:
         # Forward to upstream DoH
         headers = {'content-type': 'application/dns-message'}
         upstream_doh = config.get("upstream_doh", "https://1.1.1.1/dns-query")
+        logging.debug(f"DNS forwarding to upstream: {upstream_doh}")
         resp = await doh_client.post(upstream_doh, content=query_bytes, headers=headers)
         resp.raise_for_status()
+        logging.debug(f"DNS upstream response: {len(resp.content)} bytes, status={resp.status_code}")
         return resp.content
 
     except Exception as e:
@@ -196,9 +218,12 @@ async def process_dns_query(query_bytes: bytes) -> bytes:
 # --- DoT Server ---
 async def handle_dot_connection(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
     """Handles a single DoT connection."""
+    client_addr = writer.get_extra_info('peername')
+    logging.debug(f"DoT connection from {client_addr}")
     try:
         len_bytes = await reader.readexactly(2)
         msg_len = struct.unpack('!H', len_bytes)[0]
+        logging.debug(f"DoT reading {msg_len} bytes query from {client_addr}")
         query_bytes = await reader.readexactly(msg_len)
 
         response_bytes = await process_dns_query(query_bytes)
@@ -206,10 +231,11 @@ async def handle_dot_connection(reader: asyncio.StreamReader, writer: asyncio.St
         writer.write(struct.pack('!H', len(response_bytes)))
         writer.write(response_bytes)
         await writer.drain()
+        logging.debug(f"DoT sent {len(response_bytes)} bytes response to {client_addr}")
     except (asyncio.IncompleteReadError, ConnectionResetError):
-        pass  # Client disconnected
+        logging.debug(f"DoT client {client_addr} disconnected")
     except Exception as e:
-        logging.error(f"DoT connection error: {e}")
+        logging.error(f"DoT connection error from {client_addr}: {e}")
     finally:
         writer.close()
         await writer.wait_closed()
@@ -311,6 +337,7 @@ def parse_sni(client_hello: bytes) -> Optional[str]:
 
 async def shape_and_relay(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, settings: BypassSettings):
     """Relays traffic with padding and delay."""
+    total_bytes = 0
     try:
         while not reader.at_eof():
             data = await reader.read(4096)
@@ -325,6 +352,7 @@ async def shape_and_relay(reader: asyncio.StreamReader, writer: asyncio.StreamWr
 
             writer.write(data_to_write)
             await writer.drain()
+            total_bytes += len(data)
 
             if settings.delay_ms_range and settings.delay_ms_range[1] > 0:
                 min_delay, max_delay = settings.delay_ms_range
@@ -333,6 +361,7 @@ async def shape_and_relay(reader: asyncio.StreamReader, writer: asyncio.StreamWr
     except (asyncio.IncompleteReadError, ConnectionResetError):
         pass
     finally:
+        logging.debug(f"shape_and_relay finished: {total_bytes} bytes relayed")
         writer.close()
 
 
@@ -343,6 +372,7 @@ async def obfuscate_and_relay_ws(source_reader: asyncio.StreamReader, dest_ws: W
     The Android client strips padding using the 4-byte length suffix.
     This prevents traffic analysis based on packet sizes.
     """
+    total_bytes = 0
     try:
         while not source_reader.at_eof():
             data = await source_reader.read(2048)
@@ -357,12 +387,16 @@ async def obfuscate_and_relay_ws(source_reader: asyncio.StreamReader, dest_ws: W
                 data += pad_len_bytes + padding
 
             await dest_ws.send_bytes(data)
+            total_bytes += len(data)
     except (WebSocketDisconnect, ConnectionResetError):
         pass
+    finally:
+        logging.debug(f"obfuscate_and_relay_ws finished: {total_bytes} bytes relayed")
 
 
 async def relay_streams(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
     """Simple bidirectional relay."""
+    total_bytes = 0
     try:
         while not reader.at_eof():
             data = await reader.read(4096)
@@ -370,9 +404,11 @@ async def relay_streams(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 break
             writer.write(data)
             await writer.drain()
+            total_bytes += len(data)
     except (asyncio.IncompleteReadError, ConnectionResetError):
         pass
     finally:
+        logging.debug(f"relay_streams finished: {total_bytes} bytes relayed")
         writer.close()
 
 
@@ -384,6 +420,7 @@ async def handle_socks5_handshake(reader: asyncio.StreamReader, writer: asyncio.
     try:
         # SOCKS5 handshake: VER, NMETHODS, METHODS
         ver_nmethods = await reader.readexactly(2)
+        logging.debug(f"SOCKS5 handshake: version={ver_nmethods[0]}, methods_count={ver_nmethods[1]}")
         if ver_nmethods[0] != 0x05: return None # VER != 5
         methods_count = ver_nmethods[1]
         methods = await reader.readexactly(methods_count)
@@ -407,6 +444,7 @@ async def handle_socks5_handshake(reader: asyncio.StreamReader, writer: asyncio.
             return None
 
         target_port = int.from_bytes(await reader.readexactly(2), 'big')
+        logging.debug(f"SOCKS5 connect request: {target_host}:{target_port}")
         return target_host, target_port
     except (asyncio.IncompleteReadError, ConnectionResetError, UnicodeDecodeError):
         return None
@@ -426,6 +464,8 @@ async def handle_connection(client_reader: asyncio.StreamReader, client_writer: 
     carry decrypted plaintext. SNI was captured during the handshake.
     """
     server_name = None
+    peer_addr = client_writer.get_extra_info('peername')
+    logging.debug(f"New TLS connection from {peer_addr}")
     try:
         transport = client_writer.transport
         sock = transport.get_extra_info('socket')
@@ -455,6 +495,7 @@ async def handle_connection(client_reader: asyncio.StreamReader, client_writer: 
             is_trigger = sni_lower == bypass.trigger_sni.lower() or any(
                 sni_lower == td.lower() for td in trigger_domains
             )
+            logging.debug(f"SNI proxy: bypass enabled, trigger_sni={bypass.trigger_sni}, is_trigger={is_trigger}")
             if is_trigger:
                 use_bypass = True
             elif bypass.detect_mobile_networks and geoip_reader:
@@ -471,7 +512,7 @@ async def handle_connection(client_reader: asyncio.StreamReader, client_writer: 
                                 use_bypass = True
                                 break
                     except geoip2.errors.AddressNotFoundError:
-                        pass
+                        logging.debug(f"GeoIP: IP {ip_str} not found in database")
                     except Exception as e:
                         logging.warning(f"GeoIP lookup failed for {ip_str}: {e}")
 
@@ -511,6 +552,8 @@ async def handle_connection(client_reader: asyncio.StreamReader, client_writer: 
             target_port = 443
             logging.info(f"Bypass: Shape mode activated for mobile network -> {target_host}:{target_port}")
 
+        logging.debug(f"SNI proxy: routing {server_name} mode={proxy_mode} -> {target_host}:{target_port}")
+
         if proxy_mode == "direct":
             # For direct proxy, open a new TLS connection to the target
             # and relay decrypted client data over it (TLS-in-TLS)
@@ -543,6 +586,7 @@ async def handle_connection(client_reader: asyncio.StreamReader, client_writer: 
         if server_name:
             logging.error(f"Error in handle_connection for SNI {server_name}: {e}")
     finally:
+        logging.debug(f"SNI proxy: connection closed for {server_name}")
         client_writer.close()
 
 
@@ -582,6 +626,23 @@ async def start_sni_proxy():
 
 # --- FastAPI App (DoH, Website, and WebSocket) ---
 app = FastAPI()
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    start = time.monotonic()
+    method = request.method
+    path = request.url.path
+    client = request.client.host if request.client else "unknown"
+    logging.debug(f"--> {method} {path} from {client}")
+    try:
+        response = await call_next(request)
+        elapsed_ms = (time.monotonic() - start) * 1000
+        logging.debug(f"<-- {method} {path} {response.status_code} ({elapsed_ms:.1f}ms)")
+        return response
+    except Exception as e:
+        elapsed_ms = (time.monotonic() - start) * 1000
+        logging.error(f"<-- {method} {path} ERROR ({elapsed_ms:.1f}ms): {e}")
+        raise
 
 COVER_HTML = """<!DOCTYPE html>
 <html lang="en">
@@ -661,6 +722,7 @@ async def website_handler(request: Request, full_path: str):
 
 @app.websocket("/{full_path:path}")
 async def websocket_handler(websocket: WebSocket, full_path: str):
+    logging.debug(f"WebSocket connection attempt: path=/{full_path}")
     async with config_lock:
         bypass_settings_data = config.get("bypass_settings")
         bypass = BypassSettings(bypass_settings_data) if bypass_settings_data else None
@@ -670,11 +732,13 @@ async def websocket_handler(websocket: WebSocket, full_path: str):
         cf = CloudflareSettings(cf_data) if cf_data else None
 
     if not (bypass and bypass.enabled and bypass.mode == "websocket"):
+        logging.debug("WebSocket: bypass not enabled or not websocket mode, closing")
         await websocket.close(code=4004)
         return
 
     path_matches = f"/{full_path}".startswith(bypass.tunnel_path)
     if not path_matches:
+        logging.debug(f"WebSocket: path /{full_path} does not match tunnel_path {bypass.tunnel_path}")
         await websocket.close(code=4004)
         return
 
@@ -691,6 +755,7 @@ async def websocket_handler(websocket: WebSocket, full_path: str):
         cf_ip = websocket.headers.get("CF-Connecting-IP")
         if cf_ip:
             real_client_ip = cf_ip
+            logging.debug(f"Cloudflare: real client IP={cf_ip}")
 
     # 1. Authentication
     if bypass.bypass_secret:
@@ -699,6 +764,7 @@ async def websocket_handler(websocket: WebSocket, full_path: str):
             logging.warning(f"WebSocket bypass: Failed authentication for path /{full_path}")
             await websocket.close(code=4001)
             return
+        logging.debug("WebSocket: authentication successful")
 
     await websocket.accept()
     logging.info(f"WebSocket bypass: Client authenticated and connected successfully.")
@@ -723,15 +789,18 @@ async def websocket_handler(websocket: WebSocket, full_path: str):
         # This direction (client -> server) doesn't need obfuscation,
         # as the client-side will handle that. We just relay binary frames.
         async def ws_to_socks(ws: WebSocket, socks_writer: asyncio.StreamWriter):
+            total_bytes = 0
             try:
                 while True:
                     data = await ws.receive_bytes()
                     if data:
                         socks_writer.write(data)
                         await socks_writer.drain()
+                        total_bytes += len(data)
             except WebSocketDisconnect:
                 pass
             finally:
+                logging.debug(f"ws_to_socks finished: {total_bytes} bytes relayed")
                 socks_writer.close()
 
         task_c2s = asyncio.create_task(ws_to_socks(websocket, writer))
@@ -751,6 +820,8 @@ async def websocket_handler(websocket: WebSocket, full_path: str):
 async def main():
     global config, geoip_reader
 
+    logging.info(f"SmartSNI server starting... (debug={'ON' if DEBUG else 'OFF'})")
+
     initial_config, initial_geoip = await load_config("config.json")
     if not initial_config:
         logging.critical("Could not load initial configuration. Exiting.")
@@ -763,7 +834,8 @@ async def main():
     asyncio.create_task(start_dot_server())
     asyncio.create_task(start_sni_proxy())
 
-    uvicorn_config = uvicorn.Config(app, host="127.0.0.1", port=8080, log_level="info")
+    log_level = "debug" if DEBUG else "info"
+    uvicorn_config = uvicorn.Config(app, host="127.0.0.1", port=8080, log_level=log_level)
     server = uvicorn.Server(uvicorn_config)
     logging.info("DoH/WebSocket server listening on 127.0.0.1:8080")
     await server.serve()
