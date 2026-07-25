@@ -117,88 +117,6 @@ detect_distro() {
 }
 
 # ---------------------------------------------------------------------------
-# System requirements check
-# ---------------------------------------------------------------------------
-check_system_requirements() {
-    step "Checking system requirements"
-
-    local issues=0
-
-    # CPU cores
-    local cores
-    cores=$(nproc 2>/dev/null || echo 1)
-    if [[ $cores -ge 1 ]]; then
-        ok "CPU cores: $cores"
-    else
-        error "CPU cores: $cores (minimum: 1)"
-        ((issues++))
-    fi
-
-    # RAM
-    local ram_mb
-    ram_mb=$(free -m 2>/dev/null | awk '/^Mem:/{print $2}' || echo 0)
-    if [[ $ram_mb -ge 256 ]]; then
-        ok "RAM: ${ram_mb}MB"
-    elif [[ $ram_mb -ge 128 ]]; then
-        warn "RAM: ${ram_mb}MB (recommended: 256MB+)"
-    else
-        error "RAM: ${ram_mb}MB (minimum: 128MB)"
-        ((issues++))
-    fi
-
-    # Disk space
-    local disk_free
-    disk_free=$(df -m / 2>/dev/null | awk 'NR==2{print $4}' || echo 0)
-    if [[ $disk_free -ge 15000 ]]; then
-        ok "Disk free: ${disk_free}MB"
-    elif [[ $disk_free -ge 500 ]]; then
-        warn "Disk free: ${disk_free}MB (recommended: 15GB+)"
-    else
-        error "Disk free: ${disk_free}MB (minimum: 500MB)"
-        ((issues++))
-    fi
-
-    # Python 3
-    if command -v python3 &>/dev/null; then
-        local pyver
-        pyver=$(python3 --version 2>&1 | grep -oP '\d+\.\d+' | head -1)
-        local py_major py_minor
-        py_major=$(echo "$pyver" | cut -d. -f1)
-        py_minor=$(echo "$pyver" | cut -d. -f2)
-        if [[ $py_major -ge 3 ]] && [[ $py_minor -ge 10 ]]; then
-            ok "Python: $pyver"
-        else
-            warn "Python: $pyver (recommended: 3.10+)"
-        fi
-    else
-        error "Python 3 not found"
-        ((issues++))
-    fi
-
-    # systemd
-    if pidof systemd &>/dev/null || [[ -d /run/systemd/system ]]; then
-        ok "Systemd: available"
-    else
-        warn "Systemd not detected (service management may not work)"
-    fi
-
-    # Internet connectivity
-    if ping -c 1 -W 3 1.1.1.1 &>/dev/null; then
-        ok "Internet: connected"
-    else
-        error "No internet connection"
-        ((issues++))
-    fi
-
-    if [[ $issues -gt 0 ]]; then
-        error "$issues critical issue(s) found. Fix them before installing."
-        exit 1
-    fi
-
-    success "System requirements check passed"
-}
-
-# ---------------------------------------------------------------------------
 # Install dependencies
 # ---------------------------------------------------------------------------
 install_dependencies() {
@@ -617,9 +535,8 @@ do_install() {
     echo "  Log file: $LOG_FILE"
     echo ""
 
-    # 1. System requirements
+    # 1. Distro detection
     detect_distro
-    check_system_requirements
 
     # 2. Install packages
     install_dependencies
