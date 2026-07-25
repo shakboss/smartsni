@@ -759,14 +759,6 @@ class TLSBridge:
         )
         self._ssl_obj.set_bio(self._bio_in, self._bio_out)
 
-        server_name = None
-
-        def _sni_cb(ssl_sock, sn, ctx):
-            nonlocal server_name
-            server_name = sn
-
-        self._ssl_obj.set_servername_callback(_sni_cb)
-
         if self._initial_data:
             self._bio_in.write(self._initial_data)
 
@@ -799,7 +791,7 @@ class TLSBridge:
             await self._client_writer.drain()
 
         self._handshake_complete.set()
-        return server_name
+        return True
 
     async def read(self, n: int = 65536) -> bytes:
         while True:
@@ -862,10 +854,11 @@ async def handle_connection(client_reader: asyncio.StreamReader, client_writer: 
             return
 
         bridge = TLSBridge(ssl_ctx, client_reader, client_writer, initial_data=full_record)
-        handshake_name = await bridge.do_handshake()
-        if handshake_name:
-            server_name = handshake_name
-            logging.info(f"SNI (post-handshake): {server_name}")
+        handshake_ok = await bridge.do_handshake()
+        if not handshake_ok:
+            logging.warning("TLS handshake failed. Closing.")
+            client_writer.close()
+            return
 
         proxy_mode = "direct"
         target_host = ""
