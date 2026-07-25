@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">SmartSNI</string>
+    <string name="vpn_permission_denied">VPN permission denied</string>
+    <string name="notification_channel_name">SmartSNI VPN</string>
+    <string name="notification_channel_desc">Active VPN connection</string>
+    <string name="connected">Connected</string>
+    <string name="disconnected">Disconnected</string>
+    <string name="connecting">Connecting…</string>
+</resources>

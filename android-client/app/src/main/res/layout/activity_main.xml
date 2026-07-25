@@ -1,0 +1,160 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@color/bg_dark"
+    android:fillViewport="true">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:padding="24dp"
+        android:gravity="center_horizontal">
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="SmartSNI"
+            android:textSize="28sp"
+            android:textColor="@color/text_primary"
+            android:textStyle="bold"
+            android:layout_marginTop="32dp" />
+
+        <TextView
+            android:id="@+id/statusText"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="@string/disconnected"
+            android:textSize="14sp"
+            android:textColor="@color/disconnected_red"
+            android:layout_marginTop="4dp" />
+
+        <com.google.android.material.card.MaterialCardView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="32dp"
+            app:cardBackgroundColor="@color/bg_card"
+            app:cardCornerRadius="16dp"
+            app:cardElevation="0dp"
+            app:strokeWidth="1dp"
+            app:strokeColor="@color/input_stroke"
+            xmlns:app="http://schemas.android.com/apk/res-auto">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical"
+                android:padding="20dp">
+
+                <com.google.android.material.textfield.TextInputLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:hint="Server Host"
+                    android:layout_marginBottom="12dp"
+                    app:hintTextColor="@color/text_secondary"
+                    app:boxStrokeColor="@color/input_stroke"
+                    xmlns:app="http://schemas.android.com/apk/res-auto">
+
+                    <com.google.android.material.textfield.TextInputEditText
+                        android:id="@+id/serverHostInput"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:inputType="textUri"
+                        android:text="home.shaktt.xyz"
+                        android:textColor="@color/text_primary"
+                        android:textSize="15sp" />
+
+                </com.google.android.material.textfield.TextInputLayout>
+
+                <com.google.android.material.textfield.TextInputLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:hint="WebSocket Path"
+                    android:layout_marginBottom="12dp"
+                    app:hintTextColor="@color/text_secondary"
+                    app:boxStrokeColor="@color/input_stroke"
+                    xmlns:app="http://schemas.android.com/apk/res-auto">
+
+                    <com.google.android.material.textfield.TextInputEditText
+                        android:id="@+id/wsPathInput"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:inputType="textUri"
+                        android:text="/wstunnel"
+                        android:textColor="@color/text_primary"
+                        android:textSize="15sp" />
+
+                </com.google.android.material.textfield.TextInputLayout>
+
+                <com.google.android.material.textfield.TextInputLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:hint="Auth Secret"
+                    android:layout_marginBottom="12dp"
+                    app:hintTextColor="@color/text_secondary"
+                    app:boxStrokeColor="@color/input_stroke"
+                    app:endIconMode="password_toggle"
+                    xmlns:app="http://schemas.android.com/apk/res-auto">
+
+                    <com.google.android.material.textfield.TextInputEditText
+                        android:id="@+id/secretInput"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:inputType="textPassword"
+                        android:textColor="@color/text_primary"
+                        android:textSize="15sp" />
+
+                </com.google.android.material.textfield.TextInputLayout>
+
+                <com.google.android.material.textfield.TextInputLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:hint="Bypass Trigger SNI"
+                    android:layout_marginBottom="4dp"
+                    app:hintTextColor="@color/text_secondary"
+                    app:boxStrokeColor="@color/input_stroke"
+                    xmlns:app="http://schemas.android.com/apk/res-auto">
+
+                    <com.google.android.material.textfield.TextInputEditText
+                        android:id="@+id/triggerSniInput"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:inputType="textUri"
+                        android:text="mail.shaktt.xyz"
+                        android:textColor="@color/text_primary"
+                        android:textSize="15sp" />
+
+                </com.google.android.material.textfield.TextInputLayout>
+
+            </LinearLayout>
+
+        </com.google.android.material.card.MaterialCardView>
+
+        <TextView
+            android:id="@+id/logText"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:text=""
+            android:textSize="11sp"
+            android:textColor="@color/text_secondary"
+            android:fontFamily="monospace"
+            android:maxLines="8"
+            android:scrollbars="vertical" />
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/connectButton"
+            android:layout_width="match_parent"
+            android:layout_height="60dp"
+            android:layout_marginTop="24dp"
+            android:text="@string/disconnected"
+            android:textSize="16sp"
+            android:textAllCaps="false"
+            app:cornerRadius="16dp"
+            app:backgroundTint="@color/disconnected_red"
+            xmlns:app="http://schemas.android.com/apk/res-auto" />
+
+    </LinearLayout>
+
+</ScrollView>

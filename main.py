@@ -181,9 +181,9 @@ async def start_dot_server():
     ssl_context.load_cert_chain(cert_path, key_path)
 
     server = await asyncio.start_server(
-        handle_dot_connection, '127.0.0.1', 853, ssl=ssl_context
+        handle_dot_connection, '0.0.0.0', 853, ssl=ssl_context
     )
-    logging.info("DoT server listening on 127.0.0.1:853")
+    logging.info("DoT server listening on 0.0.0.0:853")
     async with server:
         await server.serve_forever()
 
@@ -372,8 +372,14 @@ async def handle_connection(client_reader: asyncio.StreamReader, client_writer: 
 
         record_len = int.from_bytes(header[3:5], 'big')
 
-        # 2. Read the rest of the record.
-        record_body = await asyncio.wait_for(client_reader.readexactly(record_len), timeout=5.0)
+        # 2. Read the rest of the record in chunks to be more robust.
+        record_body = b''
+        bytes_to_read = record_len
+        while bytes_to_read > 0:
+            chunk = await asyncio.wait_for(client_reader.read(bytes_to_read), timeout=5.0)
+            if not chunk: break # Connection closed prematurely
+            record_body += chunk
+            bytes_to_read -= len(chunk)
 
         # 3. We now have the full ClientHello packet.
         full_client_hello = header + record_body

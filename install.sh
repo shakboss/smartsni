@@ -25,6 +25,11 @@ install_dependencies() {
     detect_distribution
     $pm update -y
     local packages=("nginx" "git" "jq" "certbot" "python3-certbot-nginx" "python3-pip" "python3-venv")
+    if [[ "$pm" == "apt" ]]; then
+        packages+=("libcap2-bin")
+    elif [[ "$pm" == "yum" || "$pm" == "dnf" ]]; then
+        packages+=("libcap")
+    fi
     
     is_installed() {
         if [[ "$pm" == "apt" ]]; then
@@ -158,8 +163,8 @@ install() {
         pip install -r requirements.txt
         deactivate
 
-        # Grant the python binary the capability to bind to privileged ports without running as root
-        setcap 'cap_net_bind_service=+ep' "$INSTALL_DIR/venv/bin/python"
+        # Set the capability on the Python binary so it can bind to port 443
+        setcap cap_net_bind_service=+ep "$INSTALL_DIR/venv/bin/python3"
 
         # Set final permissions
         chown -R smart-sni:smart-sni "$INSTALL_DIR"
@@ -173,9 +178,12 @@ After=network.target
 User=smart-sni
 Group=smart-sni
 WorkingDirectory=$INSTALL_DIR
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 ExecStart=$INSTALL_DIR/venv/bin/python main.py
 Restart=always
 RestartSec=3
+NoNewPrivileges=false
 
 [Install]
 WantedBy=multi-user.target
@@ -208,11 +216,11 @@ uninstall() {
 }
 
 display_sites() {
-    config_file="/root/smartSNI/config.json"
     config_file="$INSTALL_DIR/config.json"
     if [ ! -f "$config_file" ]; then
         echo "Error: config.json not found. Please Install first."
     fi
+    jq -r '.domains | keys[]' "$config_file"
 }
 
 check_status() {
@@ -223,22 +231,41 @@ check_status() {
     fi
 }
 
+restart_service() {
+    echo "Restarting the SNI service..."
+    systemctl restart sni.service
+    echo "Service restart command issued. Checking status:"
+    sleep 1
+    systemctl status sni.service
+}
+
+view_logs() {
+    echo "Displaying live logs for sni.service. Press Ctrl+C to exit."
+    journalctl -u sni.service -f
+}
+
 
 clear
 echo "By --> Peyman * Github.com/Ptechgithub * "
 echo "--*-* SMART SNI PROXY (Python Edition) *-*--"
 echo ""
 echo "Select an option:"
-echo "1) Install"
-echo "2) Uninstall"
-echo "3) Show Sites"
-echo "0) Exit"
+echo " 1) Install"
+echo " 2) Uninstall"
+echo " 3) Restart Service"
+echo " 4) Check Status"
+echo " 5) View Logs"
+echo " 6) Show Sites (from config)"
+echo " 0) Exit"
 echo "----$(check_status)----"
 read -p "Enter your choice: " choice
 case "$choice" in
     1) install ;;
     2) uninstall ;;
-    3) display_sites ;;
+    3) restart_service ;;
+    4) systemctl status sni.service ;;
+    5) view_logs ;;
+    6) display_sites ;;
     0) exit ;;
     *) echo "Invalid choice." ;;
 esac
