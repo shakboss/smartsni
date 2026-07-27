@@ -1,0 +1,51 @@
+{
+  "server": {
+    "port": 443,
+    "host": "0.0.0.0",
+    "domain": "cdn.example.com",
+    "certPath": "certs/fullchain.pem",
+    "keyPath": "certs/privkey.pem"
+  },
+  "domain_fronting": {
+    "enabled": true,
+    "frontHost": "cdn.jsdelivr.net",
+    "frontSni": "cdn.jsdelivr.net",
+    "upstreamHost": "cdn.example.com",
+    "allowedOrigins": [
+      "cdn.jsdelivr.net",
+      "cdnjs.cloudflare.com",
+      "ajax.googleapis.com"
+    ]
+  },
+  "obfuscation": {
+    "minPadding": 16,
+    "maxPadding": 128,
+    "minDelayMs": 0,
+    "maxDelayMs": 50,
+    "fakeFrameIntervalMs": 3000,
+    "fakeFrameSizeMin": 32,
+    "fakeFrameSizeMax": 256
+  },
+  "relay": {
+    "idleTimeoutSec": 120,
+    "maxConnections": 200,
+    "bufferSize": 65536,
+    "sessionRotationMin": 30
+  },
+  "rateLimit": {
+    "maxPerIp": 10,
+    "windowSec": 60
+  },
+  "auth": {
+    "enabled": false,
+    "secret": ""
+  },
+  "shadowtls": {
+    "enabled": true,
+    "listenPort": 443,
+    "password": "CHANGE_ME_TO_A_STRONG_PASSWORD",
+    "handshakeServer": "www.microsoft.com",
+    "handshakePort": 443,
+    "strictMode": false
+  }
+}

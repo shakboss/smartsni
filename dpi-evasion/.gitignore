@@ -1,0 +1,23 @@
+# Binaries
+dpi-relay
+client
+*.exe
+
+# TLS certs (use certbot-setup.sh to generate)
+certs/
+
+# Build artifacts
+*.test
+*.prof
+
+# Editor
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Termux build output
+~/dpi-evasion/

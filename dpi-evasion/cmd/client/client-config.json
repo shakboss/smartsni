@@ -1,0 +1,10 @@
+{
+  "server": "YOUR_SERVER_IP",
+  "port": 443,
+  "password": "CHANGE_ME_TO_A_STRONG_PASSWORD",
+  "sni": "www.microsoft.com",
+  "mode": "shadowtls",
+  "wsPath": "/wstunnel",
+  "secret": "",
+  "socksPort": 1080
+}
