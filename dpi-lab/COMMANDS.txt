@@ -1,0 +1,203 @@
+================================================================
+dpi-lab : full command reference (dpi_probe.py)
+================================================================
+Deep Packet Inspection (DPI) analysis + evasion-testing toolkit.
+Pure Python 3, zero dependencies. Raw sockets REQUIRE root.
+
+  Usage:  sudo python3 dpi_probe.py [flags] --mode <mode>...
+
+Quick start (one line, do everything):
+  sudo python3 dpi_probe.py --target <host> --mode all \
+       --out report.txt --json report.json
+
+----------------------------------------------------------------
+REQUIREMENTS
+----------------------------------------------------------------
+- Python 3, no pip packages needed.
+- Root: raw sockets are used by `baseline`, `frag`, `diagnose`.
+  sudo python3 dpi_probe.py ...        (or run as root)
+- Only run against networks/servers you own or are authorized to test.
+
+----------------------------------------------------------------
+ALL FLAGS
+----------------------------------------------------------------
+  --target <host>     The host being filtered (domain or IP).
+                      If omitted you will be prompted.
+  --ip <1.2.3.4>      Skip DNS resolution and use this IP directly.
+                      Use when DNS is poisoned or slow.
+  --control <host>    Known-good control host (default: example.com).
+                      Results are compared against it to tell "blocked"
+                      from "server down".
+  --self-ip <ip>      Local source IP (auto-detected if omitted).
+  --src-port <n>      Fixed source port for raw probes.
+  --timeout <secs>    Socket timeout.         (default 1.5)
+  --wait <secs>       Raw-socket listen window. (default 2.5)
+  --repeats <n>       Raw consensus runs per probe. (default 3)
+  --mode <m> [...]    One or more modes, or `all`. (default: all)
+                      choices: baseline dns tls http udp frag scan
+                               diagnose all
+  --scan-full         Scan ALL ports 1-65535 (default: 50 common).
+  --selftest          Offline validation, no root/network needed.
+  --out <file>        ALSO write the text report to this file.
+  --json <file>       Write a structured JSON report (for diffing).
+
+----------------------------------------------------------------
+THE 9 MODES, EXPLAINED
+----------------------------------------------------------------
+1) baseline
+   Ports + UDP/QUIC + middlebox fingerprint.
+   Tells you: what ports listen, is UDP/QUIC filtered, and whether the
+   network mangles hand-crafted TCP (raw control sanity check).
+   - Output "MIDDLEBOX mangles non-kernel TCP" means raw `frag`
+     results are UNTRUSTED on this link; trust Track A results instead.
+
+2) dns
+   DNS poisoning check. Queries multiple resolvers (8.8.8.8, 1.1.1.1,
+   etc.) and compares answers. Mismatch => poisoned DNS.
+
+3) tls
+   SNI / fingerprint / ECH matrix. Sends ~14 TLS ClientHello variants:
+   target SNI, control SNI, no SNI, GREASE+keyshare, TLS1.2, padding,
+   ECH cover+outer SNI, etc. The variant that RSTs while the control
+   variant passes is exactly what DPI keys on.
+
+4) http
+   Host-header DPI. Same request, different Host headers. Detects
+   Host-based filtering / domain fronting feasibility.
+
+5) udp
+   Per-port UDP DPI matrix (53, 123, 443, 1194, 4500, 51820, 8080).
+   Uses REAL payloads (DNS query on 53, QUIC initial on 443) then flags
+   "TCP open but UDP silent" as per-port UDP DPI / QUIC-DNS throttle.
+
+6) frag
+   Fragmentation / camouflage matrix over raw sockets. Each variant is
+   run N times (`--repeats`) and reported as a consensus. Tests whether
+   splitting the ClientHello, padding, GREASE, etc. survives the DPI.
+
+7) scan
+   Open-port recon. Default: 50 common ports. Add `--scan-full` for the
+   whole 1-65535 range (slow).
+
+8) diagnose
+   Auto block-vector + evasion advice. Cross-references every probe's
+   results and prints BLOCKED: ... / TRY: ... recommendations.
+
+9) all
+   baseline + dns + tls + http + udp + frag + scan + diagnose.
+
+----------------------------------------------------------------
+EXAMPLES
+----------------------------------------------------------------
+
+# 0. Offline self-test (no root, no network) - validate the packet
+#    builders, x25519 RFC7748 vector, checksums, padding:
+sudo python3 dpi_probe.py --selftest
+
+# 1. Full scan of a blocked host, save both reports:
+sudo python3 dpi_probe.py --target <host> --mode all \
+       --out report.txt --json report.json
+
+# 2. Just find out what's blocking, with a known-good control:
+sudo python3 dpi_probe.py --target blocked.site \
+       --control example.com --mode all --out report.txt --json report.json
+
+# 3. Only TLS/SNI + diagnosis (fast):
+sudo python3 dpi_probe.py --target <host> --mode tls diagnose
+
+# 4. Only the TLS matrix (SNI/fingerprint/ECH):
+sudo python3 dpi_probe.py --target <host> --mode tls
+
+# 5. Only DNS poisoning check:
+sudo python3 dpi_probe.py --target <host> --mode dns
+
+# 6. Only UDP/QUIC DPI matrix:
+sudo python3 dpi_probe.py --target <host> --mode udp
+
+# 7. Skip DNS resolution (use a fixed IP - good when DNS is poisoned):
+sudo python3 dpi_probe.py --target <host> --ip 1.2.3.4 --mode all
+
+# 8. Deeper raw consensus (5 runs instead of 3) + longer windows:
+sudo python3 dpi_probe.py --target <host> --mode frag \
+       --repeats 5 --timeout 2 --wait 4 --out frag.txt
+
+# 9. Full 1-65535 port scan (slow, loud):
+sudo python3 dpi_probe.py --target <host> --mode scan --scan-full
+
+# 10. Fixed source port for raw probes:
+sudo python3 dpi_probe.py --target <host> --mode frag --src-port 30000
+
+# 11. Evasion loop: before/after comparison with JSON diff
+#     step 1 - capture "before":
+sudo python3 dpi_probe.py --target <host> --mode all --json before.json
+#     step 2 - apply your evasion (VPN, ECH, TCP-only transport, ...)
+#     step 3 - capture "after":
+sudo python3 dpi_probe.py --target <host> --mode all --json after.json
+#     step 4 - confirm the blocked vector flipped to passing:
+diff before.json after.json
+
+# 12. Run only the modes you want, all in one go:
+sudo python3 dpi_probe.py --target <host> \
+       --mode baseline dns tls http udp scan
+
+----------------------------------------------------------------
+TYPICAL MOBILE / CARRIER NETWORK WORKFLOW
+----------------------------------------------------------------
+1. Put this machine (or rooted Android Termux) on the carrier's
+   mobile-data link you want to test.
+2. Pick a host you believe the carrier blocks.
+3. Run the full scan:
+     sudo python3 dpi_probe.py --target <blocked-host> \
+            --control example.com --mode all \
+            --out report.txt --json before.json
+4. Read the BLOCKED: lines (or "INJECTED" RST signatures, TTL 255/128
+   resets, "MIDDLEBOX mangles non-kernel TCP", "UDP dropped/silenced").
+5. Apply the matching evasion from the cheat-sheet below.
+6. Re-run with --json after.json and `diff` to confirm the fix.
+   e.g. if UDP/443 (QUIC) was blocked, force TCP transports and the
+   `udp/443 blocked` finding should disappear.
+
+----------------------------------------------------------------
+READING THE REPORT - KEY LINES
+----------------------------------------------------------------
+  tcp/443 filtered (silent drop)   port blocked / not listening
+  RST / reset                      this variant is what DPI keys on
+                                   (compare vs the control variant)
+  INJECTED                         RST source IP/TTL differs from real
+                                   server => middlebox forged reset
+                                   (classic carrier DPI signature)
+  MIDDLEBOX mangles non-kernel TCP raw probes unreliable; trust kernel
+                                   socket results; frag = inconclusive
+  UDP dropped/silenced             UDP/QUIC filtered (HTTP/3 kill)
+  ECH cover SNI + ext passing      ECH evasion confirmed working
+
+----------------------------------------------------------------
+EVASION CHEAT-SHEET (match finding to fix)
+----------------------------------------------------------------
+  SNI-value blocking (RST only with target SNI):
+      TLS 1.3 ECH/ESNI (hides SNI)   <- tested by `tls` mode
+      domain fronting via CDN
+      client-side ClientHello fragmentation <- tested by `frag`
+      SNI-less TLS if the service allows
+
+  TLS-fingerprint blocking (RST even without SNI):
+      mimic a real browser (GREASE, x25519, normal ciphers)
+        <- `GREASE+keyshare` variant in `tls` mode
+
+  HTTP Host-header blocking:
+      DNS over HTTPS/TLS, IPv6, or HTTP/2
+
+  UDP / QUIC blocking:
+      TCP-based transports (HTTP/1.1, HTTP/2, DoT/853, DoH/443)
+      WireGuard / OpenVPN over TCP 443
+
+  DNS poisoning (resolver mismatch):
+      DoH / DoT, or dnsmasq with TCP upstream
+
+----------------------------------------------------------------
+NOTES
+----------------------------------------------------------------
+- `--out` and `--json` are independent; you can pass one or both.
+- `--mode` accepts several values at once (space separated).
+- First run on a fresh host: `--mode all` with `--out` + `--json`.
+- Re-run only the failing mode after each evasion to iterate fast.
